@@ -4,6 +4,7 @@
 #include <ATen/native/mkldnn/xpu/detail/Attr.h>
 #include <ATen/native/mkldnn/xpu/detail/Utils.h>
 #include <ATen/native/mkldnn/xpu/detail/oneDNNContext.h>
+#include <ATen/native/transformers/sdp_utils_cpp.h>
 
 namespace at::native::onednn {
 
@@ -167,7 +168,7 @@ void gpu_float_sdpa(
     const Tensor& key,
     const Tensor& value,
     std::optional<at::Tensor> attn_mask,
-    bool is_causal,
+    sdp::CustomMaskType causal_mask_type,
     float softmax_scale,
     const Tensor& output);
 } // namespace at::native::onednn

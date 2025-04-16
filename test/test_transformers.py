@@ -4104,6 +4104,75 @@ class TestSDPAXpuOnly(NNTestCase):
 
         self.assertEqual(actual.float(), math_ref, atol=tol.atol, rtol=tol.rtol)
 
+    @parametrize("fused_kernel", [SDPBackend.OVERRIDEABLE])
+    @parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @parametrize("batch_size,n_head,q_size,kv_size,head_dim", [
+        (2, 5, 9216, 9216, 64),
+        (2, 5, 9216, 77, 64),
+        (2, 10, 2304, 2304, 64),
+        (2, 10, 2304, 77, 64),
+        (2, 20, 576, 576, 64),
+        (2, 20, 576, 77, 64),
+        (2, 20, 144, 144, 64),
+        (2, 20, 144, 77, 64),
+        (1, 32, 1, 32, 128),
+        (4, 32, 1, 32, 128),
+        (1, 32, 32, 32, 128),
+        (4, 32, 32, 32, 128),
+        (1, 32, 2016, 2016, 128),
+        (4, 32, 2016, 2016, 128),
+    ])
+    def test_scaled_dot_product_fused_attention_bottom_right_causal_mask(
+        self,
+        device,
+        fused_kernel,
+        dtype,
+        batch_size,
+        q_size,
+        kv_size,
+        n_head,
+        head_dim,
+    ):
+        # Migrate from TestSDPACpuOnly
+        tol = Tolerances(1e-5, 5e-6)
+        if dtype is torch.bfloat16:
+            tol = Tolerances(5e-2, 5e-2)
+        if dtype is torch.float16:
+            tol = Tolerances(1e-2, 1e-2)
+        make_tensor = partial(rand_sdpa_tensor, type="dense", device=device, dtype=dtype, requires_grad=False)
+        q_shape = SdpaShape(batch_size, n_head, q_size, head_dim)
+        kv_shape = SdpaShape(batch_size, n_head, kv_size, head_dim)
+        q = make_tensor(q_shape)
+        k = make_tensor(kv_shape)
+        v = make_tensor(kv_shape)
+        q2, k2, v2 = q.clone(), k.clone(), v.clone()
+
+        # (B, nh, T, hs)
+        q = q.view(batch_size, q_size, n_head, head_dim).transpose(1, 2)
+        k = k.view(batch_size, kv_size, n_head, head_dim).transpose(1, 2)
+        v = v.view(batch_size, kv_size, n_head, head_dim).transpose(1, 2)
+
+        q2, k2, v2 = q2.float(), k2.float(), v2.float()
+        q2 = q2.view(batch_size, q_size, n_head, head_dim).transpose(1, 2)
+        k2 = k2.view(batch_size, kv_size, n_head, head_dim).transpose(1, 2)
+        v2 = v2.view(batch_size, kv_size, n_head, head_dim).transpose(1, 2)
+
+        if fused_kernel == SDPBackend.OVERRIDEABLE:
+            actual = torch.ops.aten._scaled_dot_product_fused_attention_overrideable(
+                q, k, v, attn_bias=None, dropout_p=0.0, is_causal=True)[0]
+
+        diagonal_offset = kv_size - q_size
+        attn_mask = torch.where(torch.tril(
+            torch.ones(
+                q_size, kv_size, device=device, dtype=torch.bool
+            ),
+            diagonal=diagonal_offset,
+        ), 0.0, float("-inf")).to(dtype)
+
+        math_ref = torch.ops.aten._scaled_dot_product_attention_math(
+            q2, k2, v2, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)[0]
+
+        self.assertEqual(actual.float(), math_ref, atol=tol.atol, rtol=tol.rtol)
 
 class TestAttnBias(NNTestCase):
 

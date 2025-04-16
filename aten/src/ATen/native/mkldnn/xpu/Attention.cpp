@@ -208,7 +208,7 @@ _scaled_dot_product_fused_attention_overrideable_xpu(
       key,
       value,
       attn_bias,
-      is_causal,
+      is_causal ? sdp::CustomMaskType::CausalFromBottomRight : sdp::CustomMaskType::NoCustomMask, 
       scale.has_value() ? scale.value() : (1.0 / std::sqrt(head_dim_qk)),
       output);
 
