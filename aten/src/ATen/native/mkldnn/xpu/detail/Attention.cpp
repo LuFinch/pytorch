@@ -112,12 +112,12 @@ struct SDPALogicalParams {
         dtype,
         reshaped_key.sizes().vec(),
         reshaped_key.strides().vec()};
-    scale = {
+    scale = logical_tensor(
         static_cast<size_t>(TensorID::scale),
-        to_logical_tensor_data_type(at::toOpMathType(query_.scalar_type())),
+        data_type::f32,
         scalar_shape,
         logical_tensor::layout_type::strided,
-        logical_tensor::property_type::constant};
+        logical_tensor::property_type::host_scalar);
     if (is_causal) {
       neg_inf = {
           static_cast<size_t>(TensorID::neg_inf),
@@ -358,6 +358,7 @@ void gpu_float_sdpa(
     const Tensor& output) {
   auto& eng = GpuEngineManager::Instance().get_engine();
   auto& strm = GpuStreamManager::Instance().get_stream();
+  auto& cpu_eng = CpuEngineManager::Instance().get_engine();
 
   const auto get_tril_mask = [&]() {
     auto opts = query.options();
@@ -408,10 +409,6 @@ void gpu_float_sdpa(
 
   compiled_partition = get_compiled_partition();
 
-  Tensor softmax_scale1 = at::full(
-      {},
-      softmax_scale,
-      query.options().dtype(at::toOpMathType(query.scalar_type())));
   std::optional<at::Tensor> neg_inf;
   if (is_causal) {
     neg_inf = at::full(
@@ -428,7 +425,7 @@ void gpu_float_sdpa(
   inputs.reserve(l_inputs.size());
   inputs.emplace_back(l_inputs[i++], eng, query.data_ptr());
   inputs.emplace_back(l_inputs[i++], eng, key.data_ptr());
-  inputs.emplace_back(l_inputs[i++], eng, softmax_scale1.data_ptr());
+  inputs.emplace_back(l_inputs[i++], cpu_eng, &softmax_scale);
   if (neg_inf.has_value()) {
     inputs.emplace_back(l_inputs[i++], eng, neg_inf->data_ptr());
   }

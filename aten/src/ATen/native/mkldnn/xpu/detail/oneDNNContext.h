@@ -21,6 +21,27 @@ TORCH_XPU_API dnnl::memory make_onednn_memory(
 // Keep non-static and non-inline
 bool set_onednn_verbose(int level);
 
+// CpuEngineManager singleton
+struct TORCH_XPU_API CpuEngineManager {
+  static CpuEngineManager& Instance(); // Singleton
+
+  dnnl::engine& get_engine() {
+    return host_eng;
+  }
+
+  CpuEngineManager(CpuEngineManager const&) = delete;
+  CpuEngineManager& operator=(CpuEngineManager const&) = delete;
+  CpuEngineManager(CpuEngineManager&&) = default;
+  CpuEngineManager& operator=(CpuEngineManager&&) = default;
+
+ protected:
+  CpuEngineManager();
+  ~CpuEngineManager() = default;
+
+ private:
+  dnnl::engine host_eng;
+};
+
 // GpuEngineManager singleton
 struct TORCH_XPU_API GpuEngineManager {
   static GpuEngineManager& Instance(); // Singleton
