@@ -46,8 +46,8 @@ IF(NOT MKLDNN_FOUND)
       endif()
     endif()
     ExternalProject_Add(xpu_mkldnn_proj
-      GIT_REPOSITORY https://github.com/oneapi-src/oneDNN
-      GIT_TAG v3.8.1
+      GIT_REPOSITORY https://github.com/uxlfoundation/oneDNN.git
+      GIT_TAG lvtao/main/sdpa-host-scalar
       PREFIX ${XPU_MKLDNN_DIR_PREFIX}
       BUILD_IN_SOURCE 0
       CMAKE_ARGS  -DCMAKE_C_COMPILER=icx
@@ -57,6 +57,7 @@ IF(NOT MKLDNN_FOUND)
       -DDNNL_BUILD_TESTS=OFF
       -DDNNL_BUILD_EXAMPLES=OFF
       -DONEDNN_BUILD_GRAPH=ON
+      -DONEDNN_ENABLE_GRAPH_DUMP=ON
       -DDNNL_LIBRARY_TYPE=STATIC
       -DDNNL_DPCPP_HOST_COMPILER=${DNNL_HOST_COMPILER} # Use global cxx compiler as host compiler
       -G ${CMAKE_GENERATOR} # Align Generator to Torch
