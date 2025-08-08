@@ -3,6 +3,7 @@
 #include <ATen/native/mkldnn/xpu/detail/Utils.h>
 #include <ATen/native/mkldnn/xpu/detail/oneDNN.h>
 #include <oneapi/dnnl/dnnl.hpp>
+#include <ATen/native/transformers/sdp_utils_cpp.h>
 
 namespace {
 
@@ -25,6 +26,8 @@ struct SDPALogicalParams {
     query,
     key,
     scale,
+    seq_len_q,
+    seq_len_kv,
     neg_inf,
     attn_mask,
     value,
@@ -35,10 +38,15 @@ struct SDPALogicalParams {
   logical_tensor query{};
   logical_tensor key{};
   logical_tensor scale{};
+  std::optional<logical_tensor> seqlen_q;
+  std::optional<logical_tensor> seqlen_kv;
   std::optional<logical_tensor> neg_inf;
   std::optional<logical_tensor> attn_mask;
   logical_tensor value{};
   logical_tensor output{};
+
+  data_type dtype;
+  sdp::CustomMaskType causal_mask_type;
 
   SDPALogicalParams(
       const at::Tensor& query_,
@@ -53,8 +61,9 @@ struct SDPALogicalParams {
       int num_head_kv,
       int head_dim_qk,
       int head_dim_v,
-      bool is_causal) {
-    const data_type dtype = to_logical_tensor_data_type(query_.scalar_type());
+      sdp::CustomMaskType causal_mask_type_)
+      : causal_mask_type(causal_mask_type_) {
+    dtype = to_logical_tensor_data_type(query_.scalar_type());
     TORCH_INTERNAL_ASSERT(
         (dtype != data_type::undef),
         "Only FP16/BF16/FP32 datatypes are currently supported");
@@ -118,7 +127,21 @@ struct SDPALogicalParams {
         scalar_shape,
         logical_tensor::layout_type::strided,
         logical_tensor::property_type::constant};
-    if (is_causal) {
+    if (causal_mask_type != sdp::CustomMaskType::NoCustomMask) {
+      if (causal_mask_type == sdp::CustomMaskType::CausalFromBottomRight) {
+        seqlen_q = {
+            static_cast<size_t>(TensorID::seq_len_q),
+            data_type::s32,
+            0,
+            logical_tensor::layout_type::strided,
+            logical_tensor::property_type::host_scalar};
+        seqlen_kv = {
+            static_cast<size_t>(TensorID::seq_len_kv),
+            data_type::s32,
+            0,
+            logical_tensor::layout_type::strided,
+            logical_tensor::property_type::host_scalar};
+      }
       neg_inf = {
           static_cast<size_t>(TensorID::neg_inf),
           to_logical_tensor_data_type(at::toOpMathType(query_.scalar_type())),
@@ -151,6 +174,12 @@ struct SDPALogicalParams {
   }
   std::vector<logical_tensor> get_input() const {
     std::vector<logical_tensor> input = {query, key, scale};
+    if (seqlen_q.has_value()) {
+      input.push_back(seqlen_q.value());
+    }
+    if (seqlen_kv.has_value()) {
+      input.push_back(seqlen_kv.value());
+    }
     if (neg_inf.has_value()) {
       input.push_back(neg_inf.value());
     }
@@ -165,10 +194,7 @@ struct SDPALogicalParams {
   }
 };
 
-partition create_sdpa_graph_partition(
-    bool is_causal,
-    data_type dtype,
-    const SDPALogicalParams& params) {
+partition create_sdpa_graph_partition(const SDPALogicalParams& params) {
   // graph building and partitioning
   // currently, we assume that Q and K have same sequence length
 
@@ -205,6 +231,10 @@ partition create_sdpa_graph_partition(
   // For optional implicite causal mask
   std::optional<op> mask_gen_idx_row;
   std::optional<logical_tensor> mask_row_idx;
+  std::optional<op> bottom_right_mask_add;
+  std::optional<logical_tensor> bottom_right_mask_add_out;
+  std::optional<op> bottom_right_mask_sub;
+  std::optional<logical_tensor> bottom_right_mask_sub_out;  
   std::optional<op> mask_gen_idx_col;
   std::optional<logical_tensor> mask_col_idx;
   std::optional<op> mask_gt;
@@ -213,7 +243,8 @@ partition create_sdpa_graph_partition(
 
   if (params.attn_mask.has_value()) {
     TORCH_INTERNAL_ASSERT(
-        !is_causal, "Additive mask cannot use with is_causal.");
+        params.causal_mask_type == sdp::CustomMaskType::NoCustomMask,
+        "Additive mask cannot use with is_causal.");
     masked_qk_out = {lt_id++, data_type::f32};
     mask_add = {
         op_id++,
@@ -221,7 +252,7 @@ partition create_sdpa_graph_partition(
         {scaled_qk_out, params.attn_mask.value()},
         {masked_qk_out.value()},
         "mask_add"};
-  } else if (is_causal) {
+  } else if (params.causal_mask_type != sdp::CustomMaskType::NoCustomMask) {
 #if (DNNL_VERSION_MAJOR >= 3 && DNNL_VERSION_MINOR >= 7)
     mask_row_idx = {lt_id++, data_type::s32};
     mask_gen_idx_row = {
@@ -241,11 +272,32 @@ partition create_sdpa_graph_partition(
         "mask_gen_idx_col"};
     mask_gen_idx_col->set_attr<int64_t>(op::attr::axis, -1);
 
+    if (params.causal_mask_type == sdp::CustomMaskType::CausalFromBottomRight) {
+      bottom_right_mask_add_out = {lt_id++, data_type::s32};
+      bottom_right_mask_add = {
+          op_id++,
+          op::kind::Add,
+          {mask_row_idx.value(), params.seqlen_kv.value()},
+          {bottom_right_mask_add_out.value()},
+          "bottom_right_mask_add"};
+
+      bottom_right_mask_sub_out = {lt_id++, data_type::s32};
+      bottom_right_mask_sub = {
+          op_id++,
+          op::kind::Subtract,
+          {bottom_right_mask_add_out.value(), params.seqlen_q.value()},
+          {bottom_right_mask_sub_out.value()},
+          "bottom_right_mask_sub"};
+    }
+
     mask_gt_out = {lt_id++, data_type::boolean};
     mask_gt = {
         op_id++,
         op::kind::GreaterEqual,
-        {mask_row_idx.value(), mask_col_idx.value()},
+        {params.causal_mask_type == sdp::CustomMaskType::CausalFromBottomRight
+             ? bottom_right_mask_sub_out.value()
+             : mask_row_idx.value(),
+         mask_col_idx.value()},
         {mask_gt_out.value()},
         "mask_gt"};
 
@@ -267,7 +319,7 @@ partition create_sdpa_graph_partition(
   softmax.set_attr<int64_t>(op::attr::axis, -1);
   softmax.set_attr<std::string>(op::attr::mode, "inf_as_zero");
 
-  logical_tensor softmax_out{lt_id++, dtype};
+  logical_tensor softmax_out{lt_id++, params.dtype};
   softmax.add_input(masked_qk_out.value_or(scaled_qk_out));
   softmax.add_output(softmax_out);
 
@@ -285,9 +337,13 @@ partition create_sdpa_graph_partition(
   if (mask_add.has_value()) {
     g.add_op(mask_add.value());
   }
-  if (is_causal) {
+  if (params.causal_mask_type != sdp::CustomMaskType::NoCustomMask) {
     g.add_op(mask_gen_idx_row.value());
     g.add_op(mask_gen_idx_col.value());
+    if (params.causal_mask_type == sdp::CustomMaskType::CausalFromBottomRight) {
+      g.add_op(bottom_right_mask_add.value());
+      g.add_op(bottom_right_mask_sub.value());
+    }
     g.add_op(mask_gt.value());
     g.add_op(mask_select.value());
   }
@@ -302,11 +358,9 @@ partition create_sdpa_graph_partition(
   return partitions[0];
 }
 
-partition& find_or_create_graph_partition(
-    bool is_causal,
-    const SDPALogicalParams& params) {
+partition& find_or_create_graph_partition(const SDPALogicalParams& params) {
   thread_local static PartitionCache cache;
-  const data_type dtype = params.query.get_data_type();
+  const data_type dtype = params.dtype;
 
   // cache key creation
   // patternID is determined on the basis of the arguments provided
@@ -326,14 +380,16 @@ partition& find_or_create_graph_partition(
   int pos = 8;
   // attn_mask
   patternID.set(pos++, params.attn_mask.has_value());
-  patternID.set(pos++, is_causal);
+  patternID.set(
+      pos++, params.causal_mask_type == sdp::CustomMaskType::NoCustomMask);
+  patternID.set(
+      pos++, params.causal_mask_type == sdp::CustomMaskType::CausalFromTopLeft);
 
   auto partition_ = cache.find_partition(patternID);
   if (!partition_.has_value()) {
     // partition cache no hit
     // graph building and partitioning
-    partition sdp_partition =
-        create_sdpa_graph_partition(is_causal, dtype, params);
+    partition sdp_partition = create_sdpa_graph_partition(params);
     partition_ = cache.insert_partition_cache(patternID, sdp_partition);
   }
   return *partition_;
@@ -353,7 +409,7 @@ void gpu_float_sdpa(
     const Tensor& key,
     const Tensor& value,
     std::optional<at::Tensor> attn_mask,
-    bool is_causal,
+    sdp::CustomMaskType causal_mask_type,
     float softmax_scale,
     const Tensor& output) {
   auto& eng = GpuEngineManager::Instance().get_engine();
@@ -361,8 +417,11 @@ void gpu_float_sdpa(
 
   const auto get_tril_mask = [&]() {
     auto opts = query.options();
+    int diagonal = causal_mask_type == sdp::CustomMaskType::CausalFromTopLeft
+    ? 0
+    : seq_len_kv - seq_len_q;
     auto bool_tril =
-        at::ones_symint({seq_len_q, seq_len_kv}, opts.dtype(at::kBool)).tril();
+        at::ones_symint({seq_len_q, seq_len_kv}, opts.dtype(at::kBool)).tril(diagonal);
     return at::where(
         bool_tril,
         0.f,
@@ -373,9 +432,10 @@ void gpu_float_sdpa(
   // and the reference implementation is worse than aten math + explict causal
   // mask. Fall back to explict causal mask until OneDNN v3.9 which has fp32
   // ukernel for implicit causal mask.
-  if (is_causal && query.dtype() == at::kFloat) {
+  if (causal_mask_type != sdp::CustomMaskType::NoCustomMask && 
+      query.dtype() == at::kFloat) {
     attn_mask = get_tril_mask();
-    is_causal = false;
+    causal_mask_type = sdp::CustomMaskType::NoCustomMask;
   }
 
   std::vector<dnnl::graph::logical_tensor> l_inputs, l_outputs;
@@ -395,9 +455,8 @@ void gpu_float_sdpa(
         num_head_kv,
         head_dim_qk,
         head_dim_v,
-        is_causal);
-    auto& partition_ =
-        find_or_create_graph_partition(is_causal, logical_params);
+        causal_mask_type);
+    auto& partition_ = find_or_create_graph_partition(logical_params);
     auto i = logical_params.get_input();
     auto o = logical_params.get_output();
     auto compiled_partition = partition_.compile(i, o, eng);
@@ -413,7 +472,7 @@ void gpu_float_sdpa(
       softmax_scale,
       query.options().dtype(at::toOpMathType(query.scalar_type())));
   std::optional<at::Tensor> neg_inf;
-  if (is_causal) {
+  if (causal_mask_type != sdp::CustomMaskType::NoCustomMask) {
     neg_inf = at::full(
         {},
         -INFINITY,
@@ -429,6 +488,10 @@ void gpu_float_sdpa(
   inputs.emplace_back(l_inputs[i++], eng, query.data_ptr());
   inputs.emplace_back(l_inputs[i++], eng, key.data_ptr());
   inputs.emplace_back(l_inputs[i++], eng, softmax_scale1.data_ptr());
+  if (causal_mask_type == sdp::CustomMaskType::CausalFromBottomRight) {
+    inputs.push_back(dnnl::graph::tensor::make_scalar_tensor(l_inputs[i++],&seq_len_q));
+    inputs.push_back(dnnl::graph::tensor::make_scalar_tensor(l_inputs[i++],&seq_len_kv));
+  }
   if (neg_inf.has_value()) {
     inputs.emplace_back(l_inputs[i++], eng, neg_inf->data_ptr());
   }

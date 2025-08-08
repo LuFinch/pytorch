@@ -121,6 +121,10 @@
 #endif
 #endif
 
+#ifdef USE_XPU
+#include <ATen/native/mkldnn/xpu/Attention.h>
+#endif
+
 #ifdef USE_DISTRIBUTED
 #ifdef USE_C10D
 #include <torch/csrc/distributed/autograd/python_autograd.h>
@@ -2393,6 +2397,8 @@ Call this whenever a new thread is created in order to propagate values from
       [](const sdp::sdp_params& params, bool debug) {
 #ifdef USE_CUDA
         return sdp::can_use_flash_attention(params, debug);
+#elif USE_XPU
+        return sdp::can_use_flash_attention_xpu(params, debug);
 #else
         return false;
 #endif

@@ -4132,7 +4132,7 @@ class TestSDPAXpuOnly(NNTestCase):
         if dropout > 0.0 or dtype not in [torch.float32, torch.bfloat16, torch.float16]:
             assert torch._fused_sdp_choice(q, k, v, dropout_p=dropout) == SDPBackend.MATH.value
         else:
-            assert torch._fused_sdp_choice(q, k, v, dropout_p=dropout) == SDPBackend.OVERRIDEABLE.value
+            assert torch._fused_sdp_choice(q, k, v, dropout_p=dropout) == SDPBackend.OVERRIDEABLE.value or torch._fused_sdp_choice(q, k, v, dropout_p=dropout) == SDPBackend.FLASH_ATTENTION.value
 
     def test_fused_attention_different_dk_dv(self, device):
         dtype = torch.bfloat16
@@ -4250,18 +4250,6 @@ class TestSDPAXpuOnly(NNTestCase):
 
         for permute_order in permute_orders:
             test_attention(list(permute_order) + [3])
-
-    def test_backends_flash_fallback_to_overrideable(self, device):
-        dtype = torch.bfloat16
-        q_shape = SdpaShape(1, 1, 8, 16)
-        kv_shape = SdpaShape(1, 1, 12, 16)
-        make_q = partial(torch.rand, q_shape, device=device, dtype=dtype)
-        make_kv = partial(torch.rand, kv_shape, device=device, dtype=dtype)
-        q, k, v = make_q(), make_kv(), make_kv()
-        warning_str = "Flash Attention is not supported on XPU, falling back to overrideable kernel."
-        with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
-            with self.assertWarnsRegex(UserWarning, warning_str):
-                _ = F.scaled_dot_product_attention(q, k, v)
 
     def test_backends_set_to_math(self, device):
         dtype = torch.bfloat16
@@ -4410,6 +4398,67 @@ class TestSDPAXpuOnly(NNTestCase):
 
         self.assertEqual(actual.float(), math_ref, atol=tol.atol, rtol=tol.rtol)
 
+    @parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @parametrize("batch_size,n_head,q_size,kv_size,head_dim", [
+        (2, 5, 9216, 9216, 64),
+        (2, 10, 2304, 2304, 64),
+        (2, 20, 576, 576, 64),
+        (2, 20, 144, 144, 64),
+        (1, 32, 32, 32, 128),
+        (4, 32, 32, 32, 128),
+        (1, 32, 2016, 2016, 128),
+        (4, 32, 2016, 2016, 128),
+    ])
+    def test_scaled_dot_product_fused_attention_bottom_right_causal_mask(
+        self,
+        device,
+        dtype,
+        batch_size,
+        q_size,
+        kv_size,
+        n_head,
+        head_dim,
+    ):
+        # Migrate from TestSDPACpuOnly
+        tol = Tolerances(1e-5, 5e-6)
+        if dtype is torch.bfloat16:
+            tol = Tolerances(5e-2, 5e-2)
+        if dtype is torch.float16:
+            tol = Tolerances(1e-2, 1e-2)
+        make_tensor = partial(rand_sdpa_tensor, type="dense", device=device, dtype=dtype, requires_grad=False)
+        q_shape = SdpaShape(batch_size, n_head, q_size, head_dim)
+        kv_shape = SdpaShape(batch_size, n_head, kv_size, head_dim)
+        q = make_tensor(q_shape)
+        k = make_tensor(kv_shape)
+        v = make_tensor(kv_shape)
+        q2, k2, v2 = q.clone(), k.clone(), v.clone()
+
+        # (B, nh, T, hs)
+        q = q.view(batch_size, q_size, n_head, head_dim).transpose(1, 2)
+        k = k.view(batch_size, kv_size, n_head, head_dim).transpose(1, 2)
+        v = v.view(batch_size, kv_size, n_head, head_dim).transpose(1, 2)
+
+        q2, k2, v2 = q2.float(), k2.float(), v2.float()
+        q2 = q2.view(batch_size, q_size, n_head, head_dim).transpose(1, 2)
+        k2 = k2.view(batch_size, kv_size, n_head, head_dim).transpose(1, 2)
+        v2 = v2.view(batch_size, kv_size, n_head, head_dim).transpose(1, 2)
+
+        with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
+            actual = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, dropout_p=0.0, is_causal=True)
+
+        diagonal_offset = kv_size - q_size
+        attn_mask = torch.where(torch.tril(
+            torch.ones(
+                q_size, kv_size, device=device, dtype=torch.bool
+            ),
+            diagonal=diagonal_offset,
+        ), 0.0, float("-inf")).to(dtype)
+
+        math_ref = torch.ops.aten._scaled_dot_product_attention_math(
+            q2, k2, v2, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)[0]
+
+        self.assertEqual(actual.float(), math_ref, atol=tol.atol, rtol=tol.rtol)
 
 class TestAttnBias(NNTestCase):
 
