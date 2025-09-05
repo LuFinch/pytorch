@@ -112,6 +112,7 @@ void quantized_matmul(
   // config we support:
   // activation: s8&u8; per tensor calibrated; symmetric&asymmetric
   // weight: s8; per_tensor/per_channel calibrated; symmetric
+  std::cout << "lfq:debug " << std::endl;
   auto attr = Attr(static_cast<float>(1.0 / output_scale), output_zero_point);
   construct_attr_by_post_op(
       binary_post_op,
@@ -237,12 +238,16 @@ void quantized_matmul(
       {1}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::x);
   int mask_ac = 0;
   pattr.set_scales_mask(DNNL_ARG_SRC, mask_ac);
+  pattr.set_host_scale(DNNL_ARG_SRC, dnnl::memory::data_type::f32);
   if (m1_need_zp) {
     pattr.set_zero_points_mask(DNNL_ARG_SRC, mask_ac);
+    pattr.set_host_zero_point(DNNL_ARG_SRC, dnnl::memory::data_type::s32);
   }
   pattr.set_scales_mask(DNNL_ARG_DST, mask_ac);
+  pattr.set_host_scale(DNNL_ARG_DST, dnnl::memory::data_type::f32);
   if (dst_need_zp) {
     pattr.set_zero_points_mask(DNNL_ARG_DST, mask_ac);
+    pattr.set_host_zero_point(DNNL_ARG_DST, dnnl::memory::data_type::s32);
   }
 
   if (with_bias) {
@@ -300,24 +305,22 @@ void quantized_matmul(
   args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, m2_sc_m});
 
   dnnl::memory m1_sc_m, m1_zp_m;
-  Tensor m1_sc_tensor, m1_zp_tensor;
   m1_sc_m = dnnl_memory_from_host_scalar(
-      static_cast<float>(input_scale), m1_sc_tensor, engine);
+      static_cast<float>(input_scale));
   args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, m1_sc_m});
   if (m1_need_zp) {
     m1_zp_m = dnnl_memory_from_host_scalar(
-        static_cast<int32_t>(input_zero_point), m1_zp_tensor, engine);
+        static_cast<int32_t>(input_zero_point));
     args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_SRC, m1_zp_m});
   }
 
   dnnl::memory dst_sc_m, dst_zp_m;
-  Tensor dst_sc_tensor, dst_zp_tensor;
   dst_sc_m = dnnl_memory_from_host_scalar(
-      static_cast<float>(output_scale), dst_sc_tensor, engine);
+      static_cast<float>(output_scale));
   args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, dst_sc_m});
   if (dst_need_zp) {
     dst_zp_m = dnnl_memory_from_host_scalar(
-        static_cast<int32_t>(output_zero_point), dst_zp_tensor, engine);
+        static_cast<int32_t>(output_zero_point));
     args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_DST, dst_zp_m});
   }
 

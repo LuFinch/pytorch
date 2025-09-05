@@ -198,24 +198,22 @@ at::Tensor quantized_convolution(
   }
 
   dnnl::memory src_sc_m, src_zp_m;
-  Tensor src_sc_tensor, src_zp_tensor;
   src_sc_m = dnnl_memory_from_host_scalar(
-      static_cast<float>(act_scale), src_sc_tensor, engine);
+      static_cast<float>(act_scale));
   args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, src_sc_m});
   if (src_need_zp) {
     src_zp_m = dnnl_memory_from_host_scalar(
-        static_cast<int32_t>(act_zero_point), src_zp_tensor, engine);
+        static_cast<int32_t>(act_zero_point));
     args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_SRC, src_zp_m});
   }
 
   dnnl::memory dst_sc_m, dst_zp_m;
-  Tensor dst_sc_tensor, dst_zp_tensor;
   dst_sc_m = dnnl_memory_from_host_scalar(
-      static_cast<float>(inv_output_scale), dst_sc_tensor, engine);
+      static_cast<float>(inv_output_scale));
   args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST, dst_sc_m});
   if (dst_need_zp) {
     dst_zp_m = dnnl_memory_from_host_scalar(
-        static_cast<int32_t>(output_zero_point), dst_zp_tensor, engine);
+        static_cast<int32_t>(output_zero_point));
     args.insert({DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_DST, dst_zp_m});
   }
 

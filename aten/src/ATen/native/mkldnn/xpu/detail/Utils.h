@@ -90,15 +90,13 @@ dnnl::memory::dims compatible_dilation(Vec&& dilation) {
 
 template <typename T>
 dnnl::memory dnnl_memory_from_host_scalar(
-    T host_value,
-    Tensor& holder,
-    dnnl::engine& engine) {
+    T host_value) {
   auto options = at::TensorOptions()
                      .dtype(c10::CppTypeToScalarType<T>::value)
                      .device(kXPU);
-  holder = at::empty({1}, options).fill_(host_value);
-  dnnl::memory::desc md = get_onednn_md(holder);
-  dnnl::memory mem = make_onednn_memory(md, engine, holder.data_ptr());
+  auto trait_tensor = at::empty({}, options);
+  auto dtype = get_onednn_dtype_include_double(trait_tensor, /*allow_undef*/ false);
+  dnnl::memory mem(dnnl::memory::desc::host_scalar(dtype), host_value);
   return mem;
 }
 
