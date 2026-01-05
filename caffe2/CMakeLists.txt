@@ -1211,6 +1211,14 @@ if(USE_XPU)
         FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp")
 
   endif()
+
+  if(USE_MKLDNN)
+    install(FILES ${XPU_MKLDNN_LIBRARIES}
+            DESTINATION "${TORCH_INSTALL_LIB_DIR}")
+    install(DIRECTORY ${XPU_MKLDNN_INCLUDES}
+            DESTINATION "${TORCH_INSTALL_INCLUDE_DIR}/xpu_mkldnn"
+            FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp")
+  endif()
 endif()
 
 if(NOT MSVC AND USE_XNNPACK)
@@ -1672,6 +1680,12 @@ endif()
 
 # ---[ XPU library.
 if(USE_XPU)
+  set_target_properties(torch_xpu PROPERTIES 
+    INSTALL_RPATH "$ORIGIN" )
+  target_link_options(torch_xpu PRIVATE
+    "-Wl,--disable-new-dtags"
+  )
+
   target_link_libraries(torch_xpu INTERFACE torch::xpurt)
 
   target_link_libraries(torch_xpu PUBLIC c10_xpu)

@@ -24,13 +24,15 @@ IF(NOT MKLDNN_FOUND)
       # Windows
       set(DNNL_HOST_COMPILER "DEFAULT")
       set(SYCL_CXX_DRIVER "icx")
-      set(DNNL_LIB_NAME "dnnl.lib")
+      set(DNNL_LIB_NAME "dnnl.dll")
+      set(DNNL_REAL_FILES "dnnl.dll")
     elseif(LINUX)
       # Linux
       # g++ is soft linked to /usr/bin/cxx, oneDNN would not treat it as an absolute path
       set(DNNL_HOST_COMPILER "g++")
       set(SYCL_CXX_DRIVER "icpx")
-      set(DNNL_LIB_NAME "libdnnl.a")
+      set(DNNL_LIB_NAME "libdnnl.so")
+      set(DNNL_REAL_FILES "libdnnl.so" "libdnnl.so.3" "libdnnl.so.3.10")
     else()
       MESSAGE(FATAL_ERROR "OneDNN for Intel GPU in PyTorch currently supports only Windows and Linux.
                            Detected system '${CMAKE_SYSTEM_NAME}' is not supported.")
@@ -53,11 +55,11 @@ IF(NOT MKLDNN_FOUND)
       CMAKE_ARGS  -DCMAKE_C_COMPILER=icx
       -DCMAKE_CXX_COMPILER=${SYCL_CXX_DRIVER}
       -DDNNL_GPU_RUNTIME=SYCL
-      -DDNNL_CPU_RUNTIME=THREADPOOL
+      -DDNNL_CPU_RUNTIME=OMP
       -DDNNL_BUILD_TESTS=OFF
       -DDNNL_BUILD_EXAMPLES=OFF
       -DONEDNN_BUILD_GRAPH=ON
-      -DDNNL_LIBRARY_TYPE=STATIC
+      -DDNNL_LIBRARY_TYPE=SHARED
       -DDNNL_DPCPP_HOST_COMPILER=${DNNL_HOST_COMPILER} # Use global cxx compiler as host compiler
       -G ${CMAKE_GENERATOR} # Align Generator to Torch
       BUILD_COMMAND ${DNNL_MAKE_COMMAND}
@@ -66,15 +68,24 @@ IF(NOT MKLDNN_FOUND)
     )
 
     ExternalProject_Get_Property(xpu_mkldnn_proj SOURCE_DIR BINARY_DIR)
-    set(XPU_MKLDNN_LIBRARIES ${BINARY_DIR}/src/${DNNL_LIB_NAME})
-    set(XPU_MKLDNN_INCLUDE ${SOURCE_DIR}/include ${BINARY_DIR}/include)
+    set(XPU_MKLDNN_LIB ${BINARY_DIR}/src/${DNNL_LIB_NAME})
+    set(XPU_MKLDNN_LIBRARIES "")
+    foreach(file IN LISTS DNNL_REAL_FILES)
+      list(APPEND XPU_MKLDNN_LIBRARIES "${BINARY_DIR}/src/${file}")
+    endforeach()
+    set(XPU_MKLDNN_INCLUDES ${SOURCE_DIR}/include/ ${BINARY_DIR}/include/)
     # This target would be further linked to libtorch_xpu.so.
     # The libtorch_xpu.so would contain Conv&GEMM operators that depend on
-    # oneDNN primitive implementations inside libdnnl.a.
-    add_library(xpu_mkldnn INTERFACE)
+    # oneDNN primitive implementations inside libdnnl.so.
+    add_library(xpu_mkldnn SHARED IMPORTED)
     add_dependencies(xpu_mkldnn xpu_mkldnn_proj)
-    target_link_libraries(xpu_mkldnn INTERFACE ${XPU_MKLDNN_LIBRARIES})
-    target_include_directories(xpu_mkldnn INTERFACE ${XPU_MKLDNN_INCLUDE})
+    foreach(xpu_mkldnn_include_dir IN LISTS XPU_MKLDNN_INCLUDES)
+        file(MAKE_DIRECTORY ${xpu_mkldnn_include_dir})
+    endforeach()
+    set_target_properties(xpu_mkldnn PROPERTIES
+      IMPORTED_LOCATION "${XPU_MKLDNN_LIB}"
+      INTERFACE_INCLUDE_DIRECTORIES "${XPU_MKLDNN_INCLUDES}"
+    )
   endif()
 
   IF(NOT APPLE AND NOT WIN32 AND NOT BUILD_LITE_INTERPRETER)
