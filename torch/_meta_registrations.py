@@ -6004,7 +6004,7 @@ def meta__scaled_dot_product_fused_attention_overrideable_backward(
     grad_v = torch.empty_like(value)
 
     grad_attn_bias = None
-    if attn_bias is not None:
+    if attn_bias is not None and grad_input_mask[3]:
         grad_attn_bias = torch.empty_like(attn_bias)
     return grad_q, grad_k, grad_v, grad_attn_bias
 

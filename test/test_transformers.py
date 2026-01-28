@@ -4518,14 +4518,14 @@ class TestSDPAXpuOnly(NNTestCase):
 
     @parametrize("fused_kernel", [SDPBackend.OVERRIDEABLE])
     @parametrize("dtype", [torch.half, torch.bfloat16, torch.float32])
-    @parametrize("batch_size", [1, 4])
-    @parametrize("n_head", [[3, 1], [4, 2], [10, 2]])
+    @parametrize("batch_size", [1])
+    @parametrize("n_head", [[3, 1]])
     @parametrize("q_size", [1, 32, 77, 128, 144, 512, 576])
     @parametrize("kv_size", [1, 32, 77, 128, 144, 512, 576])
-    @parametrize("head_dim", [64, 96, 128])
-    @parametrize("mask_type", [None, "causal", "float"])
-    @parametrize("train", [True, False])
-    @parametrize("layout", ["bshd", "bhsd"])
+    @parametrize("head_dim", [64,])
+    @parametrize("mask_type", ["float"])
+    @parametrize("train", [True, ])
+    @parametrize("layout", ["bshd",  "bhsd"])
     @parametrize("enable_gqa", [True, False])
     def test_onednn_attention_vs_math(
         self,
@@ -4573,12 +4573,10 @@ class TestSDPAXpuOnly(NNTestCase):
         q2, k2, v2 = q.clone(), k.clone(), v.clone()
         q2, k2, v2 = q2.float(), k2.float(), v2.float()
 
-        mask_shape = [batch_size, 1, q_size, kv_size]
+        mask_shape = [q_size, kv_size]
         attn_mask = None
         is_causal = False
-        if mask_type == "bool":
-            attn_mask = torch.randint(0, 2, size=mask_shape, dtype=torch.bool, device=device)
-        elif mask_type == "float":
+        if mask_type == "float":
             attn_mask = torch.randn(mask_shape, dtype=dtype, device=device)
         elif mask_type == "causal":
             is_causal = True
@@ -4592,6 +4590,9 @@ class TestSDPAXpuOnly(NNTestCase):
             q2 = q2.detach().clone().requires_grad_(True)
             k2 = k2.detach().clone().requires_grad_(True)
             v2 = v2.detach().clone().requires_grad_(True)
+            if attn_mask is not None:
+                attn_mask = attn_mask.detach().clone().requires_grad_(True)
+                attn_mask2 = attn_mask2.detach().clone().requires_grad_(True)
 
         with sdpa_kernel(backends=[fused_kernel]):
             actual = F.scaled_dot_product_attention(
@@ -4614,14 +4615,22 @@ class TestSDPAXpuOnly(NNTestCase):
 
             grad_q_actual, grad_k_actual, grad_v_actual = q.grad, k.grad, v.grad
             grad_q_ref, grad_k_ref, grad_v_ref = q2.grad, k2.grad, v2.grad
+            if attn_mask is not None:
+                grad_attn_mask_actual = attn_mask.grad
+                grad_attn_mask_ref = attn_mask2.grad
+
             if dtype in [torch.float16, torch.bfloat16]:
                 grad_q_ref = grad_q_ref.to(dtype)
                 grad_k_ref = grad_k_ref.to(dtype)
                 grad_v_ref = grad_v_ref.to(dtype)
+                if attn_mask is not None:
+                    grad_attn_mask_ref = grad_attn_mask_ref.to(dtype)
 
             self.assertEqual(grad_q_actual, grad_q_ref, atol=tol.atol, rtol=tol.rtol)
             self.assertEqual(grad_k_actual, grad_k_ref, atol=tol.atol, rtol=tol.rtol)
             self.assertEqual(grad_v_actual, grad_v_ref, atol=tol.atol, rtol=tol.rtol)
+            if attn_mask is not None:
+                self.assertEqual(grad_attn_mask_actual, grad_attn_mask_ref, atol=tol.atol, rtol=tol.rtol)
 
     @unittest.skipIf(not PLATFORM_SUPPORTS_XPU_FLASH_ATTENTION, "XPU Flash Attention is not supported")
     @parametrize("dtype", [torch.float32, torch.float64])

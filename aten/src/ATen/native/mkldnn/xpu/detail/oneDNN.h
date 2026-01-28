@@ -204,7 +204,9 @@ void sdpa_backward(
     float softmax_scale,
     Tensor& grad_query,
     Tensor& grad_key,
-    Tensor& grad_value);
+    Tensor& grad_value,
+    bool attn_mask_requires_grad,
+    Tensor& grad_attn_mask);
 
 sycl::event scaled_matmul(
     const Tensor& mat1,
