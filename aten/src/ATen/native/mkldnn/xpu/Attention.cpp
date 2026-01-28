@@ -8,6 +8,42 @@
 #include <torch/library.h>
 
 namespace {
+bool check_attn_mask_shape_xpu(sdp::sdp_params const& params, bool debug) {
+  auto attn_mask = params.attn_mask;
+  if (!attn_mask.has_value()) {
+    return true;
+  }
+  auto batchSize = params.query.sym_size(0);
+  auto qSize = params.query.sym_size(2);
+  auto kvSize = params.key.sym_size(2);
+  auto num_head = params.query.sym_size(1);
+  if (attn_mask.value().sym_size(-2) != qSize &&
+      attn_mask.value().sym_size(-2) != 1) {
+    return false;
+  }
+  if (attn_mask.value().sym_size(-1) != kvSize &&
+      attn_mask.value().sym_size(-1) != 1) {
+    return false;
+  }
+  if (attn_mask.value().dim() == 2) {
+    return true;
+  } else if (attn_mask.value().dim() == 4) {
+    if ((attn_mask.value().sym_size(0) == 1 ||
+         attn_mask.value().sym_size(0) == batchSize) &&
+        (attn_mask.value().sym_size(1) == 1 ||
+         attn_mask.value().sym_size(1) == num_head)) {
+      return true;
+    }
+  }
+  if (debug) {
+    TORCH_WARN(
+        "Please use the following attn mask shapes: ",
+        "2d - ({Q_seq_len, 1}  x {KV_seq_len, 1}); ",
+        "4d - ({Batch, 1} x {Num_heads, 1} x {Q_seq_len, 1}  x {KV_seq_len, 1})");
+  }
+  return false;
+}
+
 bool check_head_dim_size_xpu(sdp::sdp_params const& params, bool debug) {
   const auto query_size_last = params.query.sym_size(-1);
   const auto key_size_last = params.key.sym_size(-1);
@@ -41,31 +77,6 @@ bool check_head_dim_size_xpu(sdp::sdp_params const& params, bool debug) {
   return true;
 }
 
-bool input_require_grad(
-    const at::Tensor& query,
-    const at::Tensor& key,
-    const at::Tensor& value,
-    const std::optional<at::Tensor>& attn_mask) {
-  return at::GradMode::is_enabled() &&
-      (query.requires_grad() || key.requires_grad() || value.requires_grad() ||
-       (attn_mask.has_value() && attn_mask.value().requires_grad()));
-}
-
-bool check_grad(sdp::sdp_params const& params, bool debug) {
-  if (!input_require_grad(
-          params.query, params.key, params.value, params.attn_mask))
-    return true;
-
-  bool attn_mask_needs_grad =
-      params.attn_mask.has_value() && params.attn_mask.value().requires_grad();
-  if (debug && attn_mask_needs_grad) {
-    TORCH_WARN(
-        "scale_dot_product_attention on xpu is not supported when attn_mask.requires_grad() == True.");
-  }
-
-  return !attn_mask_needs_grad;
-}
-
 bool can_use_overrideable_attention(sdp::sdp_params const& params, bool debug) {
   constexpr auto supported_dtypes = c10::array_of<at::ScalarType>(
       at::kFloat, at::kBFloat16, at::kHalf); // double is not supported
@@ -77,11 +88,10 @@ bool can_use_overrideable_attention(sdp::sdp_params const& params, bool debug) {
       sdp::check_for_dropout,
       sdp::check_tensor_shapes,
       sdp::check_batch_size_and_num_heads_dense<true /*supports GQA*/>,
-      sdp::check_attn_mask_shape,
       sdp::check_nonzero_sequence_lengths_dense,
       sdp::check_last_dim_stride_equals_1_dense<false /*ignore_singleton_dim*/>,
-      check_head_dim_size_xpu,
-      check_grad);
+      check_attn_mask_shape_xpu,
+      check_head_dim_size_xpu);
   for (auto& constraint : constraints) {
     if (!constraint(params, debug)) {
       return false;
@@ -327,9 +337,6 @@ _scaled_dot_product_fused_attention_overrideable_xpu(
   TORCH_INTERNAL_ASSERT(
       !(attn_bias.has_value() && is_causal),
       "scaled_dot_product_fused_attention_overrideable_xpu: attn_bias cannot present with is_causal");
-  TORCH_INTERNAL_ASSERT(
-      !(attn_bias.has_value() && attn_bias.value().requires_grad()),
-      "scaled_dot_product_fused_attention_overrideable_xpu: attn_bias cannot have requires_grad=True");
 
   const int64_t batch_size = query.size(0);
   const int64_t num_head_q = query.size(1);
@@ -447,8 +454,18 @@ _scaled_dot_product_fused_attention_overrideable_backward_xpu(
   auto grad_q = at::empty_like(query);
   auto grad_k = at::empty_like(key);
   auto grad_v = at::empty_like(value);
-  auto grad_attn_bias = attn_bias_opt.has_value()
+  bool attn_bias_requires_grad =
+      attn_bias_opt.has_value() && grad_input_mask[3];
+  auto grad_attn_bias_final = attn_bias_requires_grad
       ? at::empty_like(attn_bias_opt.value())
+      : at::Tensor();
+
+  // OneDNN graph will output a fp32[batch_size, num_head_q, seq_len_q,
+  // seq_len_kv] tensor.
+  auto grad_attn_bias = attn_bias_requires_grad
+      ? at::empty(
+            {batch_size, num_head_q, seq_len_q, seq_len_kv},
+            query.options().dtype(at::kFloat))
       : at::Tensor();
   at::native::onednn::sdpa_backward(
       batch_size,
@@ -469,12 +486,27 @@ _scaled_dot_product_fused_attention_overrideable_backward_xpu(
       scale.has_value() ? scale.value() : (1.0 / std::sqrt(query.size(3))),
       grad_q,
       grad_k,
-      grad_v);
+      grad_v,
+      attn_bias_requires_grad,
+      grad_attn_bias);
+
+  if (attn_bias_requires_grad &&
+      (grad_attn_bias_final.dtype() != grad_attn_bias.dtype() ||
+       grad_attn_bias_final.sizes() != grad_attn_bias.sizes())) {
+    if (grad_attn_bias_final.dim() == 2) {
+      grad_attn_bias_final.unsqueeze(0).unsqueeze(0);
+    }
+    grad_attn_bias_final =
+        grad_attn_bias.sum_to_size(grad_attn_bias_final.sizes())
+            .to(grad_attn_bias_final.dtype());
+  } else {
+    grad_attn_bias_final = grad_attn_bias;
+  }
   return std::make_tuple(
       std::move(grad_q),
       std::move(grad_k),
       std::move(grad_v),
-      std::move(grad_attn_bias));
+      std::move(grad_attn_bias_final));
 }
 
 REGISTER_XPU_DISPATCH(_fused_sdp_choice_stub, &_fused_sdp_choice_xpu);

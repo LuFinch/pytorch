@@ -375,6 +375,7 @@ struct SDPABackwardLogicalParams {
     grad_query,
     grad_key,
     grad_value,
+    grad_attn_mask,
     end,
   };
 
@@ -390,9 +391,11 @@ struct SDPABackwardLogicalParams {
   logical_tensor grad_query{};
   logical_tensor grad_key{};
   logical_tensor grad_value{};
+  logical_tensor grad_attn_mask{};
 
   bool is_causal;
   bool is_gqa;
+  bool attn_mask_requires_grad;
 
   SDPABackwardLogicalParams(
       const at::Tensor& grad_out_,
@@ -405,6 +408,7 @@ struct SDPABackwardLogicalParams {
       const at::Tensor& grad_query_,
       const at::Tensor& grad_key_,
       const at::Tensor& grad_value_,
+      const at::Tensor& grad_attn_mask_,
       int batch_size,
       int num_head_q,
       int num_head_kv,
@@ -412,8 +416,11 @@ struct SDPABackwardLogicalParams {
       int seq_len_kv,
       int head_dim_qk,
       int head_dim_v,
-      bool is_causal_)
-      : is_causal(is_causal_), is_gqa(num_head_q != num_head_kv) {
+      bool is_causal_,
+      bool attn_mask_requires_grad_)
+      : is_causal(is_causal_),
+        is_gqa(num_head_q != num_head_kv),
+        attn_mask_requires_grad(attn_mask_requires_grad_) {
     const data_type dtype = to_logical_tensor_data_type(query_.scalar_type());
     TORCH_INTERNAL_ASSERT(
         (dtype != data_type::undef),
@@ -442,6 +449,7 @@ struct SDPABackwardLogicalParams {
     at::Tensor reshaped_query = query_;
     at::Tensor reshaped_key = key_;
     at::Tensor reshaped_value = value_;
+    at::Tensor reshaped_grad_attn_mask = grad_attn_mask_;
     at::Tensor reshaped_out = out_;
     at::Tensor reshaped_logsumexp = logsumexp_.unsqueeze(-1);
     at::Tensor reshaped_attn_mask = attn_mask_.value_or(at::Tensor());
@@ -492,6 +500,10 @@ struct SDPABackwardLogicalParams {
       if (attn_mask_.has_value() && attn_mask_.value().dim() == 4) {
         reshaped_attn_mask = reshaped_attn_mask.unsqueeze(2);
       }
+      if (attn_mask_requires_grad && grad_attn_mask_.dim() == 4) {
+        reshaped_grad_attn_mask = grad_attn_mask_.view(
+            {batch_size, group_num, group_size, seq_len_q, seq_len_kv});
+      }
     }
 
 #define LOGIC_TENSOR_DESC(name, dtype)     \
@@ -532,6 +544,9 @@ struct SDPABackwardLogicalParams {
     LOGIC_TENSOR_DESC(grad_query, dtype);
     LOGIC_TENSOR_DESC(grad_key, dtype);
     LOGIC_TENSOR_DESC(grad_value, dtype);
+    if (attn_mask_requires_grad) {
+      LOGIC_TENSOR_DESC(grad_attn_mask, sdpa_intermediate_dtype);
+    }
 #undef LOGIC_TENSOR_DESC
   }
   std::vector<logical_tensor> get_input() const {
@@ -547,6 +562,9 @@ struct SDPABackwardLogicalParams {
   }
   std::vector<logical_tensor> get_output() const {
     std::vector<logical_tensor> output = {grad_query, grad_key, grad_value};
+    if (attn_mask_requires_grad) {
+      output.push_back(grad_attn_mask);
+    }
     return output;
   }
 };
@@ -556,6 +574,7 @@ partition create_sdpa_backward_graph_partition(
   // graph building and partitioning
   bool is_causal = params.is_causal;
   bool is_gqa = params.is_gqa;
+  bool attn_mask_requires_grad = params.attn_mask_requires_grad;
   data_type dtype = params.query.get_data_type();
 
   size_t lt_id = static_cast<size_t>(SDPABackwardLogicalParams::TensorID::end);
@@ -698,6 +717,9 @@ partition create_sdpa_backward_graph_partition(
 
   // grad_masked_score = softmaxbackward(grad_prop)
   logical_tensor grad_masked_score{lt_id++, sdpa_intermediate_dtype};
+  if (attn_mask_requires_grad) {
+    grad_masked_score = params.grad_attn_mask;
+  }
   op softmax_backward{
       op_id++,
       op::kind::SoftMaxBackward,
@@ -706,8 +728,16 @@ partition create_sdpa_backward_graph_partition(
       "softmax_backward"};
   softmax_backward.set_attr<int64_t>(op::attr::axis, -1);
 
-  // TODO: add output tensor grad_attn_mask = grad_masked_score once OneDNN
-  // supports output grad_attn_mask.
+  // add output tensor grad_attn_mask = grad_masked_score if required
+  std::optional<op> output_grad_attn_mask;
+  if (attn_mask_requires_grad) {
+    output_grad_attn_mask =
+        op(op_id++,
+           op::kind::End,
+           {grad_masked_score},
+           {},
+           "output_grad_attn_mask");
+  }
 
   // grad_scaled_score = grad_masked_score * scale
   logical_tensor grad_scaled_score{lt_id++, sdpa_intermediate_dtype};
@@ -777,6 +807,9 @@ partition create_sdpa_backward_graph_partition(
   g.add_op(matmul_grad_value);
   g.add_op(matmul_grad_prop);
   g.add_op(softmax_backward);
+  if (attn_mask_requires_grad) {
+    g.add_op(output_grad_attn_mask.value());
+  }
   g.add_op(grad_scale_mul);
   g.add_op(matmul_grad_query);
   g.add_op(matmul_grad_key);
@@ -816,6 +849,7 @@ partition& find_or_create_backward_graph_partition(
   patternID.set(pos++, params.attn_mask.has_value());
   patternID.set(pos++, params.is_causal);
   patternID.set(pos++, params.is_gqa);
+  patternID.set(pos++, params.attn_mask_requires_grad);
 
   auto partition_ = cache.find_partition(patternID);
   if (!partition_.has_value()) {
@@ -947,7 +981,9 @@ void sdpa_backward(
     float softmax_scale,
     Tensor& grad_query,
     Tensor& grad_key,
-    Tensor& grad_value) {
+    Tensor& grad_value,
+    bool attn_mask_requires_grad,
+    Tensor& grad_attn_mask) {
   auto& eng = GpuEngineManager::Instance().get_engine();
   auto& strm = GpuStreamManager::Instance().get_stream();
 
@@ -984,6 +1020,7 @@ void sdpa_backward(
       grad_query,
       grad_key,
       grad_value,
+      grad_attn_mask,
       batch_size,
       num_head_q,
       num_head_kv,
@@ -991,7 +1028,8 @@ void sdpa_backward(
       seq_len_kv,
       head_dim_qk,
       head_dim_v,
-      is_causal);
+      is_causal,
+      attn_mask_requires_grad);
   auto& partition =
       sdpa_backward::find_or_create_backward_graph_partition(logical_params);
   l_inputs = std::move(logical_params.get_input());
@@ -1003,6 +1041,9 @@ void sdpa_backward(
       {l_outputs[1], eng, grad_key.data_ptr()},
       {l_outputs[2], eng, grad_value.data_ptr()},
   };
+  if (attn_mask_requires_grad) {
+    outputs.emplace_back(l_outputs[3], eng, grad_attn_mask.data_ptr());
+  }
 
   size_t i = 0;
   std::vector<dnnl::graph::tensor> inputs;
