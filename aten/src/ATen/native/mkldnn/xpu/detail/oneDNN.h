@@ -183,7 +183,10 @@ void sdpa(
     float softmax_scale,
     const Tensor& attention,
     bool compute_logsumexp,
-    const Tensor& logsumexp);
+    const Tensor& logsumexp,
+    float dropout_probability,
+    const Tensor& philox_seed,
+    const Tensor& philox_offset);
 
 void sdpa_backward(
     int batch_size,
@@ -206,7 +209,10 @@ void sdpa_backward(
     Tensor& grad_key,
     Tensor& grad_value,
     bool attn_mask_requires_grad,
-    Tensor& grad_attn_mask);
+    Tensor& grad_attn_mask,
+    float dropout_probability,
+    const Tensor& philox_seed,
+    const Tensor& philox_offset);
 
 sycl::event scaled_matmul(
     const Tensor& mat1,

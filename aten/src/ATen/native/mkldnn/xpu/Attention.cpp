@@ -4,6 +4,7 @@
 #include <ATen/native/transformers/sdp_utils.h>
 #include <ATen/native/transformers/sdp_utils_cpp.h>
 #include <ATen/native/transformers/xpu/sdp_utils.h>
+#include <ATen/xpu/XPUGeneratorImpl.h>
 #include <c10/util/Array.h>
 #include <torch/library.h>
 
@@ -85,7 +86,6 @@ bool can_use_overrideable_attention(sdp::sdp_params const& params, bool debug) {
   constexpr auto constraints = c10::array_of<bool (*)(
       sdp::sdp_params const&, bool)>(
       sdp::check_nested_tensor,
-      sdp::check_for_dropout,
       sdp::check_tensor_shapes,
       sdp::check_batch_size_and_num_heads_dense<true /*supports GQA*/>,
       sdp::check_nonzero_sequence_lengths_dense,
@@ -332,9 +332,6 @@ _scaled_dot_product_fused_attention_overrideable_xpu(
       query.size(1) % key.size(1) == 0,
       "scaled_dot_product_fused_attention_overrideable_xpu: number of heads in K/V must divide number of heads in Q");
   TORCH_INTERNAL_ASSERT(
-      dropout_p == 0.0,
-      "scaled_dot_product_fused_attention_overrideable_xpu: Currently do not support dropout > 0");
-  TORCH_INTERNAL_ASSERT(
       !(attn_bias.has_value() && is_causal),
       "scaled_dot_product_fused_attention_overrideable_xpu: attn_bias cannot present with is_causal");
 
@@ -355,6 +352,24 @@ _scaled_dot_product_fused_attention_overrideable_xpu(
   at::Tensor logsumexp =
       at::empty({batch_size, num_head_q, seq_len_q}, opts.dtype(at::kFloat));
 
+  at::Tensor philox_seed, philox_offset;
+  if (dropout_p != 0.0) {
+    auto gen = at::get_generator_or_default<at::XPUGeneratorImpl>(
+        std::nullopt, at::xpu::detail::getDefaultXPUGenerator());
+    // number of times random will be generated per thread, to offset philox
+    // counter in thc random state
+    int64_t counter_offset = batch_size * num_head_q * seq_len_q * seq_len_kv;
+    // See Note [Acquire lock when using random generators]
+    std::lock_guard<std::mutex> lock(gen->mutex_);
+    at::PhiloxXpuState philox_state = gen->philox_xpu_state(counter_offset);
+    std::tuple<uint64_t, uint64_t> unpack_state =
+        xpu::philox::unpack(philox_state);
+    philox_seed = at::full(
+        {}, std::get<0>(unpack_state), at::dtype(at::kLong).device(at::kCPU));
+    philox_offset = at::full(
+        {}, std::get<1>(unpack_state), at::dtype(at::kLong).device(at::kCPU));
+  }
+
   at::native::onednn::sdpa(
       batch_size,
       seq_len_q,
@@ -371,11 +386,11 @@ _scaled_dot_product_fused_attention_overrideable_xpu(
       scale.has_value() ? scale.value() : (1.0 / std::sqrt(head_dim_qk)),
       attention,
       true,
-      logsumexp);
+      logsumexp,
+      dropout_p,
+      philox_seed,
+      philox_offset);
 
-  // rng not used
-  auto philox_seed = at::empty({}, at::dtype(at::kLong));
-  auto philox_offset = at::empty({}, at::dtype(at::kLong));
   return std::make_tuple(
       attention,
       logsumexp,
@@ -429,9 +444,6 @@ _scaled_dot_product_fused_attention_overrideable_backward_xpu(
   TORCH_INTERNAL_ASSERT(
       value.size(3) == grad_out.size(3),
       "scaled_dot_product_fused_attention_overrideable_backward_xpu: V should have the same head_dim as grad_out");
-  TORCH_INTERNAL_ASSERT(
-      dropout_p == 0.0,
-      "scaled_dot_product_fused_attention_overrideable_backward_xpu: Currently do not support dropout > 0");
   TORCH_INTERNAL_ASSERT(
       logsumexp.dim() == 3 && logsumexp.size(0) == query.size(0) &&
       logsumexp.size(1) == query.size(1) &&
@@ -488,7 +500,10 @@ _scaled_dot_product_fused_attention_overrideable_backward_xpu(
       grad_k,
       grad_v,
       attn_bias_requires_grad,
-      grad_attn_bias);
+      grad_attn_bias,
+      dropout_p,
+      philox_seed,
+      philox_offset);
 
   if (attn_bias_requires_grad &&
       (grad_attn_bias_final.dtype() != grad_attn_bias.dtype() ||
