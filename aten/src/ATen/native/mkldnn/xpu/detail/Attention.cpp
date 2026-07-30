@@ -177,19 +177,19 @@ struct SDPALogicalParams {
         logical_tensor::data_type::f32,
         scalar_shape,
         logical_tensor::layout_type::strided,
-        logical_tensor::property_type::constant};
+        logical_tensor::property_type::variable};
       dropout_seed = {
         static_cast<size_t>(TensorID::dropout_seed),
         logical_tensor::data_type::s64,
         scalar_shape,
         logical_tensor::layout_type::strided,
-        logical_tensor::property_type::constant};
+        logical_tensor::property_type::variable};
       dropout_offset = {
         static_cast<size_t>(TensorID::dropout_offset),
         logical_tensor::data_type::s64,
         scalar_shape,
         logical_tensor::layout_type::strided,
-        logical_tensor::property_type::constant};
+        logical_tensor::property_type::variable};
     }
 #undef LOGIC_TENSOR_DESC
 #undef LOGIC_SCALAR_TENSOR_DESC
@@ -621,19 +621,19 @@ struct SDPABackwardLogicalParams {
         logical_tensor::data_type::f32,
         scalar_shape,
         logical_tensor::layout_type::strided,
-        logical_tensor::property_type::constant};
+        logical_tensor::property_type::variable};
       dropout_seed = {
         static_cast<size_t>(TensorID::dropout_seed),
         logical_tensor::data_type::s64,
         scalar_shape,
         logical_tensor::layout_type::strided,
-        logical_tensor::property_type::constant};
+        logical_tensor::property_type::variable};
       dropout_offset = {
         static_cast<size_t>(TensorID::dropout_offset),
         logical_tensor::data_type::s64,
         scalar_shape,
         logical_tensor::layout_type::strided,
-        logical_tensor::property_type::constant};
+        logical_tensor::property_type::variable};
     }
 #undef LOGIC_TENSOR_DESC
   }
