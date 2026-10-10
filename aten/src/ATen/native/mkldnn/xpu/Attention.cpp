@@ -362,6 +362,9 @@ _scaled_dot_product_fused_attention_overrideable_xpu(
       query,
       key,
       value,
+      /* q_descale */ std::nullopt,
+      /* k_descale */ std::nullopt,
+      /* v_descale */ std::nullopt,
       attn_bias,
       is_causal,
       scale.has_value() ? scale.value() : (1.0 / std::sqrt(head_dim_qk)),
@@ -379,6 +382,201 @@ _scaled_dot_product_fused_attention_overrideable_xpu(
       /* cum_seq_k */ at::Tensor(),
       seq_len_q,
       seq_len_kv,
+      std::move(philox_seed),
+      std::move(philox_offset),
+      std::move(debug_attn_mask));
+}
+
+std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    c10::SymInt,
+    c10::SymInt,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
+// Referenced by native_functions.yaml.
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+_scaled_dot_product_flash_attention_xpu_quantized(
+    const Tensor& query, // shape :math:`(N, H_q, L, E)` dtype float8_e4m3fn
+    const Tensor& key, // shape :math:`(N, H, S, E)` dtype float8_e4m3fn
+    const Tensor& value, // shape :math:`(N, H, S, E_v)` dtype float8_e4m3fn
+    const std::optional<Tensor>&
+        q_descale, // shape :math:`(N, H)` for PER_HEAD, dtype float32
+    const std::optional<Tensor>&
+        k_descale, // shape :math:`(N, H)` for PER_HEAD, dtype float32
+    const std::optional<Tensor>&
+        v_descale, // shape :math:`(N, H)` for PER_HEAD, dtype float32
+    double dropout_p,
+    bool is_causal,
+    bool return_debug_mask,
+    std::optional<double> scale) {
+  TORCH_CHECK(
+      query.dim() == 4 && key.dim() == 4 && value.dim() == 4,
+      "_scaled_dot_product_flash_attention_xpu_quantized: Accept only 4 dims inputs shape of {N, H, L, E}");
+  TORCH_CHECK(
+      query.scalar_type() == at::kFloat8_e4m3fn &&
+          key.scalar_type() == at::kFloat8_e4m3fn &&
+          value.scalar_type() == at::kFloat8_e4m3fn,
+      "_scaled_dot_product_flash_attention_xpu_quantized: Expected query/key/value to have Float8_e4m3fn data type, but got ",
+      query.scalar_type(),
+      ", ",
+      key.scalar_type(),
+      ", ",
+      value.scalar_type());
+  TORCH_CHECK(
+      query.device() == key.device() && query.device() == value.device(),
+      "_scaled_dot_product_flash_attention_xpu_quantized: Expected query/key/value to be on the same device, but got ",
+      query.device(),
+      ", ",
+      key.device(),
+      ", ",
+      value.device());
+
+  const int64_t batch_size = query.size(0);
+  const int64_t num_head_q = query.size(1);
+  const int64_t num_head_kv = key.size(1);
+  const int64_t seq_len_q = query.size(2);
+  const int64_t seq_len_kv = key.size(2);
+  const int64_t head_dim_qk = query.size(3);
+  const int64_t head_dim_v = value.size(3);
+
+  TORCH_CHECK(
+      query.size(0) == key.size(0),
+      "_scaled_dot_product_flash_attention_xpu_quantized: Q/K should have the same batch size");
+  TORCH_CHECK(
+      (key.size(0) == value.size(0)) && (key.size(1) == value.size(1)) &&
+          (key.size(2) == value.size(2)),
+      "_scaled_dot_product_flash_attention_xpu_quantized: K/V should have the same batch / seq / num_head");
+  TORCH_CHECK(
+      head_dim_qk == key.size(3),
+      "_scaled_dot_product_flash_attention_xpu_quantized: Q/K should have the same head_dim");
+  TORCH_CHECK(
+      num_head_q == num_head_kv,
+      "_scaled_dot_product_flash_attention_xpu_quantized: oneDNN does not support GQA/MQA for FP8 yet, but got ",
+      num_head_q,
+      " query heads and ",
+      num_head_kv,
+      " key/value heads");
+  TORCH_CHECK(
+      seq_len_q > 0 && key.size(2) > 0,
+      "_scaled_dot_product_flash_attention_xpu_quantized: Q/K sequence lengths must be non-zero");
+  TORCH_CHECK(
+      query.stride(-1) == 1 && key.stride(-1) == 1 && value.stride(-1) == 1,
+      "_scaled_dot_product_flash_attention_xpu_quantized: Q/K/V must have contiguous last dimension");
+
+  TORCH_CHECK(
+      !is_causal,
+      "_scaled_dot_product_flash_attention_xpu_quantized: oneDNN does not support is_causal for FP8 yet");
+  TORCH_CHECK(
+      dropout_p == 0.0,
+      "_scaled_dot_product_flash_attention_xpu_quantized: Currently do not support dropout > 0");
+  TORCH_CHECK(
+      !return_debug_mask,
+      "_scaled_dot_product_flash_attention_xpu_quantized: Currently do not support return_debug_mask");
+
+  // Descaling is all-or-nothing: mixing descaled and raw FP8 operands would
+  // silently produce a wrongly scaled result.
+  const bool has_q_descale = q_descale.has_value();
+  const bool has_k_descale = k_descale.has_value();
+  const bool has_v_descale = v_descale.has_value();
+  TORCH_CHECK(
+      has_q_descale && has_q_descale == has_k_descale &&
+          has_q_descale == has_v_descale,
+      "_scaled_dot_product_flash_attention_xpu_quantized: q_descale, k_descale and v_descale must all be provided, but got ",
+      has_q_descale,
+      ", ",
+      has_k_descale,
+      ", ",
+      has_v_descale);
+
+  // All descale tensors are indexed by num_head_kv. For GQA, q_descale is
+  // broadcast from (N, H_kv) to the query heads internally.
+  const auto check_descale = [&](const std::optional<Tensor>& descale,
+                                 const char* name) {
+    if (!descale.has_value()) {
+      return;
+    }
+    TORCH_CHECK(
+        descale->scalar_type() == at::kFloat,
+        "_scaled_dot_product_flash_attention_xpu_quantized: ",
+        name,
+        "_descale must have Float data type, but got ",
+        descale->scalar_type());
+    TORCH_CHECK(
+        descale->device() == query.device(),
+        "_scaled_dot_product_flash_attention_xpu_quantized: ",
+        name,
+        "_descale must be on the same device as query, but got ",
+        descale->device(),
+        " and ",
+        query.device());
+    TORCH_CHECK(
+        descale->dim() == 2 && descale->size(0) == batch_size &&
+            descale->size(1) == num_head_kv,
+        "_scaled_dot_product_flash_attention_xpu_quantized: ",
+        name,
+        "_descale must have shape (",
+        batch_size,
+        ", ",
+        num_head_kv,
+        ") for PER_HEAD descaling, but got ",
+        descale->sizes());
+  };
+  check_descale(q_descale, "q");
+  check_descale(k_descale, "k");
+  check_descale(v_descale, "v");
+
+  const double softmax_scale =
+      scale.has_value() ? scale.value() : (1.0 / std::sqrt(head_dim_qk));
+
+  // Attention output; shape :math:`(N, H_q, L, E_v)` dtype bfloat16.
+  // FP8 attention accumulates in higher precision and returns BF16, matching
+  // the CUDA FA3 quantized op.
+  const std::vector<int64_t> output_shape = {
+      batch_size, num_head_q, seq_len_q, head_dim_v};
+  at::Tensor output =
+      at::empty(output_shape, query.options().dtype(at::kBFloat16));
+
+  // logsumexp is only needed by backward, which FP8 does not support.
+  at::Tensor logsumexp, debug_attn_mask;
+  // dropout is rejected above.
+  auto philox_seed = at::empty({}, at::dtype(at::kLong));
+  auto philox_offset = at::empty({}, at::dtype(at::kLong));
+
+  at::native::onednn::sdpa(
+      batch_size,
+      seq_len_q,
+      seq_len_kv,
+      num_head_q,
+      num_head_kv,
+      head_dim_qk,
+      head_dim_v,
+      query,
+      key,
+      value,
+      q_descale,
+      k_descale,
+      v_descale,
+      std::nullopt,
+      is_causal,
+      softmax_scale,
+      output,
+      false,
+      logsumexp,
+      dropout_p,
+      philox_seed,
+      philox_offset);
+
+  return std::make_tuple(
+      std::move(output),
+      std::move(logsumexp),
+      /* cum_seq_q */ at::Tensor(),
+      /* cum_seq_k */ at::Tensor(),
+      seq_len_q,
+      key.size(2),
       std::move(philox_seed),
       std::move(philox_offset),
       std::move(debug_attn_mask));

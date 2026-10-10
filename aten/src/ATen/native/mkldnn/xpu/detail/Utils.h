@@ -137,10 +137,10 @@ struct PartitionCache {
   std::unordered_map<std::bitset<32>, dnnl::graph::partition> partition_map_{};
 
   // The first 8 bits are reserved
-  // bit 0: is int8
-  // bit 1: is uint8
-  // bit 2: fp16(0) / bf16(1)
-  // bit 3: is fp32
+  // bit 0: fp16
+  // bit 1: bf16
+  // bit 2: fp32
+  // bit 3: is fp8
   // bit 4: is sdpa pattern
   // bit 5: is sdpa backward pattern
   // bit 6-7: reserved for future use
@@ -148,10 +148,10 @@ struct PartitionCache {
   // However, down the line, we might have different bitsets for different
   // patterns
   enum class BitType : uint8_t {
-    Int8 = 0,
-    Uint8 = 1,
-    Bfloat16 = 2,
-    Float32 = 3,
+    Float16 = 0,
+    Bfloat16 = 1,
+    Float32 = 2,
+    Float8 = 3,
     SdpaPattern = 4,
     SdpaBwdPattern = 5
   };

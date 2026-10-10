@@ -1,16 +1,22 @@
 # Owner(s): ["module: intel"]
 
+import warnings
 from collections import namedtuple
 
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
+from torch.nn.attention.experimental._scaled_dot_product_attention_quantized import (
+    _scaled_dot_product_attention_quantized,
+    DescaleType,
+)
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_nn import NNTestCase
 from torch.testing._internal.common_utils import parametrize, run_tests
 
 
 Tolerances = namedtuple("Tolerances", ["atol", "rtol"])
+SdpaShape = namedtuple("SdpaShape", ["batch", "num_heads", "seq_len", "head_dim"])
 
 
 class TestSDPAXpuOnly(NNTestCase):
@@ -278,8 +284,153 @@ class TestSDPAXpuOnly(NNTestCase):
         self.assertEqual(actual, expected, atol=tol.atol, rtol=tol.rtol)
 
 
+class TestFP8SDPAXpuOnly(NNTestCase):
+    """FP8 scaled dot product attention, i.e.
+    _scaled_dot_product_flash_attention_xpu_quantized.
+
+    oneDNN does not support is_causal or GQA/MQA on the FP8 path yet, so those
+    are only covered as negative tests below.
+    """
+
+    @staticmethod
+    def _fp8(shape, device):
+        return torch.randn(shape, dtype=torch.bfloat16, device=device).to(
+            torch.float8_e4m3fn
+        )
+
+    @staticmethod
+    def _descale(batch, heads, device, value=1.0):
+        return torch.full((batch, heads), value, dtype=torch.float32, device=device)
+
+    @staticmethod
+    def _fp8_sdpa(query, key, value, q_descale, k_descale, v_descale, is_causal=False):
+        return _scaled_dot_product_attention_quantized(
+            query,
+            key,
+            value,
+            is_causal=is_causal,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            q_descale_type=DescaleType.PER_HEAD,
+            k_descale_type=DescaleType.PER_HEAD,
+            v_descale_type=DescaleType.PER_HEAD,
+        )
+
+    @parametrize("batch", [1, 2])
+    @parametrize("seq_len", [512, 1024])
+    @parametrize("heads", [4, 8])
+    @parametrize("head_dim", [64, 128])
+    def test_fp8_attention_forward_runs(self, device, batch, seq_len, heads, head_dim):
+        torch.manual_seed(0)
+        shape = SdpaShape(batch, heads, seq_len, head_dim)
+        query, key, value = (self._fp8(shape, device) for _ in range(3))
+        descale = self._descale(batch, heads, device)
+
+        with torch.no_grad():
+            actual = self._fp8_sdpa(query, key, value, descale, descale, descale)
+
+        self.assertEqual(actual.shape, torch.Size(shape))
+        self.assertEqual(actual.dtype, torch.bfloat16)  # FP8 inputs produce bfloat16
+        self.assertTrue(torch.isfinite(actual).all())
+
+    def test_fp8_attention_matches_math(self, device):
+        """Compare against MATH on the dequantized inputs.
+
+        The kernel additionally round-trips the softmax probs through FP8, which
+        the reference does not, hence the loose tolerance.
+        """
+        tol = Tolerances(0.25, 0.25)
+        batch, heads, seq_len, head_dim = 2, 8, 512, 64
+        torch.manual_seed(0)
+        shape = SdpaShape(batch, heads, seq_len, head_dim)
+        query, key, value = (self._fp8(shape, device) for _ in range(3))
+        descale = self._descale(batch, heads, device)
+
+        with torch.no_grad():
+            actual = self._fp8_sdpa(query, key, value, descale, descale, descale)
+            with sdpa_kernel(backends=[SDPBackend.MATH]):
+                expected = F.scaled_dot_product_attention(
+                    query.to(torch.bfloat16),
+                    key.to(torch.bfloat16),
+                    value.to(torch.bfloat16),
+                )
+
+        self.assertEqual(actual, expected, atol=tol.atol, rtol=tol.rtol)
+
+    def test_fp8_attention_descale_is_applied(self, device):
+        """A descale of s on V scales the output by s, and q_descale is not ignored."""
+        batch, heads, seq_len, head_dim = 1, 2, 128, 64
+        torch.manual_seed(0)
+        shape = SdpaShape(batch, heads, seq_len, head_dim)
+        query, key, value = (self._fp8(shape, device) for _ in range(3))
+        one = self._descale(batch, heads, device)
+
+        with torch.no_grad():
+            base = self._fp8_sdpa(query, key, value, one, one, one)
+            scaled_v = self._fp8_sdpa(query, key, value, one, one, one * 2)
+            scaled_q = self._fp8_sdpa(query, key, value, one * 0.1, one, one)
+
+        self.assertEqual(scaled_v.float(), base.float() * 2, atol=0.3, rtol=0.05)
+        self.assertNotEqual(scaled_q.float(), base.float())
+
+    def test_fp8_attention_backward_warns(self, device):
+        batch, heads, seq_len, head_dim = 2, 4, 256, 64
+        torch.manual_seed(0)
+        shape = SdpaShape(batch, heads, seq_len, head_dim)
+        query, key, value = (self._fp8(shape, device) for _ in range(3))
+        query.requires_grad_(True)
+        descale = self._descale(batch, heads, device)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self._fp8_sdpa(query, key, value, descale, descale, descale)
+
+        self.assertTrue(
+            any("backward" in str(w.message).lower() for w in caught),
+            msg="Expected a warning that the FP8 backward pass is unsupported",
+        )
+
+    def test_fp8_attention_compiles(self, device):
+        batch, heads, seq_len, head_dim = 2, 8, 512, 64
+        torch.manual_seed(0)
+        shape = SdpaShape(batch, heads, seq_len, head_dim)
+        query, key, value = (self._fp8(shape, device) for _ in range(3))
+        descale = self._descale(batch, heads, device)
+
+        with torch.no_grad():
+            eager = self._fp8_sdpa(query, key, value, descale, descale, descale)
+            compiled_fn = torch.compile(self._fp8_sdpa, fullgraph=True)
+            compiled = compiled_fn(query, key, value, descale, descale, descale)
+
+        self.assertEqual(eager.stride(), compiled.stride())
+        self.assertEqual(eager, compiled, atol=0, rtol=0)
+
+    def test_fp8_attention_causal_unsupported(self, device):
+        torch.manual_seed(0)
+        shape = SdpaShape(1, 2, 128, 64)
+        query, key, value = (self._fp8(shape, device) for _ in range(3))
+        one = self._descale(shape.batch, shape.num_heads, device)
+
+        with torch.no_grad(), self.assertRaisesRegex(RuntimeError, "is_causal"):
+            self._fp8_sdpa(query, key, value, one, one, one, is_causal=True)
+
+    def test_fp8_attention_gqa_unsupported(self, device):
+        torch.manual_seed(0)
+        kv_shape = SdpaShape(1, 2, 128, 64)
+        query = self._fp8(SdpaShape(1, 4, 128, 64), device)
+        key, value = (self._fp8(kv_shape, device) for _ in range(2))
+        one = self._descale(kv_shape.batch, kv_shape.num_heads, device)
+
+        with torch.no_grad(), self.assertRaisesRegex(RuntimeError, "GQA/MQA"):
+            self._fp8_sdpa(query, key, value, one, one, one)
+
+
 instantiate_device_type_tests(
     TestSDPAXpuOnly, globals(), only_for="xpu", allow_xpu=True
+)
+instantiate_device_type_tests(
+    TestFP8SDPAXpuOnly, globals(), only_for="xpu", allow_xpu=True
 )
 
 if __name__ == "__main__":
