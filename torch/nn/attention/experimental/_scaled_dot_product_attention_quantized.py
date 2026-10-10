@@ -57,8 +57,8 @@ def _validate_descale(
         raise ValueError(f"{name}_descale must have dtype float32, got {descale.dtype}")
 
     # Check device
-    if not descale.is_cuda:
-        raise ValueError(f"{name}_descale must be a CUDA tensor")
+    if not (descale.is_cuda or descale.is_xpu):
+        raise ValueError(f"{name}_descale must be a CUDA or XPU tensor")
 
     # Check shape based on descale type
     if descale_type == DescaleType.PER_HEAD:
