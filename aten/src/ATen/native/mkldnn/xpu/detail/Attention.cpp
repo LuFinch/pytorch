@@ -239,19 +239,9 @@ struct SDPALogicalParams {
       LOGIC_TENSOR_DESC(q_descale, logical_tensor::data_type::f32);
       LOGIC_TENSOR_DESC(k_descale, logical_tensor::data_type::f32);
       LOGIC_TENSOR_DESC(v_descale, logical_tensor::data_type::f32);
-      const dims p_scale_shape = {1};
-      p_scale = {
-          static_cast<size_t>(TensorID::p_scale),
-          logical_tensor::data_type::f32,
-          p_scale_shape,
-          logical_tensor::layout_type::strided,
-          logical_tensor::property_type::constant};
-      p_descale = {
-          static_cast<size_t>(TensorID::p_descale),
-          logical_tensor::data_type::f32,
-          p_scale_shape,
-          logical_tensor::layout_type::strided,
-          logical_tensor::property_type::constant};
+      LOGIC_SCALAR_TENSOR_DESC(p_scale, logical_tensor::data_type::f32);
+      LOGIC_SCALAR_TENSOR_DESC(p_descale, logical_tensor::data_type::f32);
+
     }
 #undef LOGIC_TENSOR_DESC
 #undef LOGIC_SCALAR_TENSOR_DESC
@@ -467,8 +457,8 @@ partition create_sdpa_graph_partition(const SDPALogicalParams& params) {
         "probs_quantize"};
     probs_quantize->set_attr<std::string>(op::attr::qtype, "per_tensor");
 
-    ynamically dequant the probs from quantized type to f32 logical_tensor
-        probs_f32{lt_id++, sdpa_intermediate_dtype};
+    // dynamically dequant the probs from quantized type to f32
+    logical_tensor probs_f32{lt_id++, sdpa_intermediate_dtype};
     probs_dequantize = {
         op_id++,
         op::kind::DynamicDequantize,
@@ -490,64 +480,66 @@ partition create_sdpa_graph_partition(const SDPALogicalParams& params) {
     value = value_f32;
 
     logical_tensor attention_f32 =
-        log cal_tensor(lt_id++, sdpa_intermediate_dtype);
+        logical_tensor(lt_id++, sdpa_intermediate_dtype);
     attention = attention_f32;
   } else {
     probs = softmax_out;
   }
 
-  op matmul_v{op_id++, kind::MatMul, bs, value}, ention
-}
-,
-    mul_v "};
+  op matmul_v{
+    op_id++, 
+    op::kind::MatMul, 
+    {probs, value}, 
+    {attention},
+     "matmul_v"
+  };
 
-    ptional<op>
-        attention_typecast;
-if (is_fp8) {
-  attention_typecast = {
-      op_id++,
-      op::kind::TypeCast,
-      {attention},
-      {params.attention},
-      "attention_typecast"};
-}
-
-constexpr auto ekind = dnnl::engine::kind::gpu;
-dnnl::graph::graph g(ekind);
-g.add_op(matmul_qk);
-g.add_op(scale_mul);
-if (mask_add.has_value()) {
-  g.add_op(mask_add.value());
-}
-if (is_causal) {
-  g.add_op(mask_gen_idx_row.value());
-  g.add_op(mask_gen_idx_col.value());
-  g.add_op(mask_gt.value());
-  g.add_op(mask_select.value());
-}
-
-g.add_op(softmax);
-if (enable_dropout) {
-  g.add_op(dropout.value());
-  if (dropout_typecast.has_value()) {
-    g.add_op(dropout_typecast.value());
+  std::optional<op> attention_typecast;
+  if (is_fp8) {
+    attention_typecast = {
+        op_id++,
+        op::kind::TypeCast,
+        {attention},
+        {params.attention},
+        "attention_typecast"};
   }
-}
-g.add_op(matmul_v);
-if (is_fp8) {
-  g.add_op(query_dequantize.value());
-  g.add_op(key_dequantize.value());
-  g.add_op(probs_quantize.value());
-  g.add_op(probs_dequantize.value());
-  g.add_op(value_dequantize.value());
-  g.add_op(attention_typecast.value());
-}
-g.finalize();
-auto partitions = g.get_partitions();
-TORCH_INTERNAL_ASSERT(
-    (partitions.size() == 1) && partitions[0].is_supported(),
-    "oneDNN doesn't support this fusion pattern. If you'd like its support, please submit a issue.");
-return partitions[0];
+
+  constexpr auto ekind = dnnl::engine::kind::gpu;
+  dnnl::graph::graph g(ekind);
+  g.add_op(matmul_qk);
+  g.add_op(scale_mul);
+  if (mask_add.has_value()) {
+    g.add_op(mask_add.value());
+  }
+  if (is_causal) {
+    g.add_op(mask_gen_idx_row.value());
+    g.add_op(mask_gen_idx_col.value());
+    g.add_op(mask_gt.value());
+    g.add_op(mask_select.value());
+  }
+
+  g.add_op(softmax);
+  if (enable_dropout) {
+    g.add_op(dropout.value());
+    if (dropout_typecast.has_value()) {
+      g.add_op(dropout_typecast.value());
+    }
+  }
+  g.add_op(matmul_v);
+  if (is_fp8) {
+    g.add_op(query_dequantize.value());
+    g.add_op(key_dequantize.value());
+    g.add_op(probs_quantize.value());
+    g.add_op(probs_dequantize.value());
+    g.add_op(value_dequantize.value());
+    g.add_op(attention_typecast.value());
+  }
+  g.finalize();
+  auto partitions = g.get_partitions();
+  TORCH_INTERNAL_ASSERT(
+      (partitions.size() == 1) && partitions[0].is_supported(),
+      "oneDNN doesn't support this fusion pattern. If you'd like its support, please submit a issue.");
+  return partitions[0];
 }
 
 partition& find_or_create_graph_partition(const SDPALogicalParams& params) {
@@ -1309,17 +1301,16 @@ void sdpa(
   }
   ADD_INPUT(value_aligned);
 
-  st
-
-      ional<at::Tensor>
-          p_scale;
+  std::optional<at::Tensor> p_scale;
   if (q_descale.has_value()) {
     ADD_INPUT((*q_descale_aligned));
     ADD_INPUT((*k_descale_aligned));
     ADD_INPUT((*v_descale_aligned));
-    p_scale = at::full({}, 1.0, query_aligned.options().dtype(at::kFloat));
-    inputs.emplace_back(l_inputs[i++], eng, p_scale->data_ptr());
-    inputs.emplace_back(l_inputs[i++], eng, p_scale->data_ptr());
+    constexpr float p_scale = 1.f;
+    inputs.emplace_back(
+      dnnl::graph::tensor::make_scalar_tensor(l_inputs[i++], const_cast<float*>(&p_scale)));
+    inputs.emplace_back(
+      dnnl::graph::tensor::make_scalar_tensor(l_inputs[i++], const_cast<float*>(&p_scale)));
   }
 #undef ADD_INPUT
 
@@ -1454,4 +1445,4 @@ void sdpa_backward(
 
   compiled_partition->execute(strm, inputs, outputs);
 }
-} // namespace at::native::onednn        
+} // namespace at::native::onednn
