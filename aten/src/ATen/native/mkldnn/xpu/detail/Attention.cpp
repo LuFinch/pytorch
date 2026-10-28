@@ -1306,11 +1306,12 @@ void sdpa(
     ADD_INPUT((*q_descale_aligned));
     ADD_INPUT((*k_descale_aligned));
     ADD_INPUT((*v_descale_aligned));
-    constexpr float p_scale = 1.f;
+    constexpr float p_scale = 1.0f / 256.f;
+    constexpr float p_descale = 1.0f / 256.f;
     inputs.emplace_back(
       dnnl::graph::tensor::make_scalar_tensor(l_inputs[i++], const_cast<float*>(&p_scale)));
     inputs.emplace_back(
-      dnnl::graph::tensor::make_scalar_tensor(l_inputs[i++], const_cast<float*>(&p_scale)));
+      dnnl::graph::tensor::make_scalar_tensor(l_inputs[i++], const_cast<float*>(&p_descale)));
   }
 #undef ADD_INPUT
 
