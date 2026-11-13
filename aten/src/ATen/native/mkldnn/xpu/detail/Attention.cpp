@@ -72,6 +72,7 @@ struct SDPALogicalParams {
   bool compute_logsumexp;
   bool enable_dropout;
   bool is_fp8;
+  bool is_gqa;
 
   SDPALogicalParams(
       const at::Tensor& query_,
@@ -96,7 +97,8 @@ struct SDPALogicalParams {
       : is_causal(is_causal_),
         compute_logsumexp(compute_logsumexp_),
         enable_dropout(enable_dropout_),
-        is_fp8(q_descale_.has_value()) {
+        is_fp8(q_descale_.has_value()),
+        is_gqa(num_head_q != num_head_kv) {
     const data_type dtype = to_logical_tensor_data_type(query_.scalar_type());
     TORCH_INTERNAL_ASSERT(
         (dtype != data_type::undef),
@@ -153,8 +155,8 @@ struct SDPALogicalParams {
       at::native::onednn::undo_broadcast(reshaped_attn_mask);
     }
 
-    if (num_head_q != num_head_kv) { // Check whether the attention is a
-                                     // Grouped-Query Attention (GQA)
+    if (is_gqa) { // Check whether the attention is a
+                  // Grouped-Query Attention (GQA)
       int group_num = num_head_kv;
       int group_size = num_head_q / num_head_kv;
       // oneDNN requires the shape of the query tensor to be represented as
@@ -241,7 +243,6 @@ struct SDPALogicalParams {
       LOGIC_TENSOR_DESC(v_descale, logical_tensor::data_type::f32);
       LOGIC_SCALAR_TENSOR_DESC(p_scale, logical_tensor::data_type::f32);
       LOGIC_SCALAR_TENSOR_DESC(p_descale, logical_tensor::data_type::f32);
-
     }
 #undef LOGIC_TENSOR_DESC
 #undef LOGIC_SCALAR_TENSOR_DESC
@@ -301,7 +302,7 @@ partition create_sdpa_graph_partition(const SDPALogicalParams& params) {
         op(op_id++, op::kind::DynamicDequantize, "query_dequantize");
     query_dequantize->add_inputs({params.query, params.q_descale.value()});
     query_dequantize->add_outputs({query});
-    query_dequantize->set_attr<int64_t>(op::attr::mask, 3);
+    query_dequantize->set_attr<int64_t>(op::attr::mask, params.is_gqa ? 7 : 3);
 
     key = logical_tensor(lt_id++, sdpa_intermediate_dtype);
     key_dequantize = op(op_id++, op::kind::DynamicDequantize, "key_dequantize");
@@ -487,12 +488,7 @@ partition create_sdpa_graph_partition(const SDPALogicalParams& params) {
   }
 
   op matmul_v{
-    op_id++, 
-    op::kind::MatMul, 
-    {probs, value}, 
-    {attention},
-     "matmul_v"
-  };
+      op_id++, op::kind::MatMul, {probs, value}, {attention}, "matmul_v"};
 
   std::optional<op> attention_typecast;
   if (is_fp8) {
@@ -573,6 +569,8 @@ partition& find_or_create_graph_partition(const SDPALogicalParams& params) {
   patternID.set(pos++, params.compute_logsumexp);
   // enable_dropout
   patternID.set(pos++, params.enable_dropout);
+  // is_gqa
+  patternID.set(pos++, params.is_gqa);
 
   auto partition_ = cache.find_partition(patternID);
   if (!partition_.has_value()) {
@@ -1211,7 +1209,15 @@ void sdpa(
   std::optional<Tensor> k_descale_aligned = std::nullopt;
   std::optional<Tensor> v_descale_aligned = std::nullopt;
   if (q_descale.has_value()) {
-    q_descale_aligned = ensure_alignment_for_sdpa(q_descale.value());
+    at::Tensor q_descale_grouped = q_descale.value();
+    if (num_head_q != num_head_kv) {
+      // oneDNN GQA expects one q scale per query head
+      const int64_t group_size = num_head_q / num_head_kv;
+      q_descale_grouped = q_descale_grouped.unsqueeze(-1)
+                              .expand({batch_size, num_head_kv, group_size})
+                              .contiguous();
+    }
+    q_descale_aligned = ensure_alignment_for_sdpa(q_descale_grouped);
     k_descale_aligned = ensure_alignment_for_sdpa(k_descale.value());
     v_descale_aligned = ensure_alignment_for_sdpa(v_descale.value());
   }
@@ -1308,10 +1314,10 @@ void sdpa(
     ADD_INPUT((*v_descale_aligned));
     constexpr float p_scale = 1.0f / 256.f;
     constexpr float p_descale = 1.0f / 256.f;
-    inputs.emplace_back(
-      dnnl::graph::tensor::make_scalar_tensor(l_inputs[i++], const_cast<float*>(&p_scale)));
-    inputs.emplace_back(
-      dnnl::graph::tensor::make_scalar_tensor(l_inputs[i++], const_cast<float*>(&p_descale)));
+    inputs.emplace_back(dnnl::graph::tensor::make_scalar_tensor(
+        l_inputs[i++], const_cast<float*>(&p_scale)));
+    inputs.emplace_back(dnnl::graph::tensor::make_scalar_tensor(
+        l_inputs[i++], const_cast<float*>(&p_descale)));
   }
 #undef ADD_INPUT
 

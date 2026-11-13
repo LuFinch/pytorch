@@ -454,8 +454,8 @@ _scaled_dot_product_flash_attention_xpu_quantized(
       head_dim_qk == key.size(3),
       "_scaled_dot_product_flash_attention_xpu_quantized: Q/K should have the same head_dim");
   TORCH_CHECK(
-      num_head_q == num_head_kv,
-      "_scaled_dot_product_flash_attention_xpu_quantized: oneDNN does not support GQA/MQA for FP8 yet, but got ",
+      num_head_kv > 0 && num_head_q % num_head_kv == 0,
+      "_scaled_dot_product_flash_attention_xpu_quantized: number of heads in K/V must divide number of heads in Q, but got ",
       num_head_q,
       " query heads and ",
       num_head_kv,
