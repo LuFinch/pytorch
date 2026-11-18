@@ -288,8 +288,8 @@ class TestFP8SDPAXpuOnly(NNTestCase):
     """FP8 scaled dot product attention, i.e.
     _scaled_dot_product_flash_attention_xpu_quantized.
 
-    oneDNN does not support is_causal or GQA/MQA on the FP8 path yet, so those
-    are only covered as negative tests below.
+    oneDNN does not support is_causal on the FP8 path yet, so it is only covered
+    as a negative test below.
     """
 
     @staticmethod
@@ -415,14 +415,51 @@ class TestFP8SDPAXpuOnly(NNTestCase):
         with torch.no_grad(), self.assertRaisesRegex(RuntimeError, "is_causal"):
             self._fp8_sdpa(query, key, value, one, one, one, is_causal=True)
 
-    def test_fp8_attention_gqa_unsupported(self, device):
+    @parametrize("num_heads_q,num_heads_kv", [(8, 4), (8, 2), (8, 1), (16, 4)])
+    @parametrize("compile", [False, True])
+    def test_fp8_attention_gqa(self, device, num_heads_q, num_heads_kv, compile):
+        """GQA/MQA with a different descale per batch and kv head, compared against
+        MATH on the dequantized inputs. q_descale is indexed by kv head and shared
+        by the query heads of the same group.
+        """
+        tol = Tolerances(0.25, 0.25)
+        batch, seq_len, head_dim = 2, 512, 64
+        group_size = num_heads_q // num_heads_kv
         torch.manual_seed(0)
-        kv_shape = SdpaShape(1, 2, 128, 64)
-        query = self._fp8(SdpaShape(1, 4, 128, 64), device)
+        shape = SdpaShape(batch, num_heads_q, seq_len, head_dim)
+        kv_shape = SdpaShape(batch, num_heads_kv, seq_len, head_dim)
+        query = self._fp8(shape, device)
         key, value = (self._fp8(kv_shape, device) for _ in range(2))
-        one = self._descale(kv_shape.batch, kv_shape.num_heads, device)
+        q_descale, k_descale, v_descale = (
+            torch.empty(batch, num_heads_kv, device=device).uniform_(0.5, 1.5)
+            for _ in range(3)
+        )
+        fp8_sdpa = self._fp8_sdpa
+        if compile:
+            fp8_sdpa = torch.compile(fp8_sdpa, fullgraph=True)
 
-        with torch.no_grad(), self.assertRaisesRegex(RuntimeError, "GQA/MQA"):
+        def dequantize(x, descale):
+            return x.float() * descale[:, :, None, None]
+
+        with torch.no_grad():
+            actual = fp8_sdpa(query, key, value, q_descale, k_descale, v_descale)
+            with sdpa_kernel(backends=[SDPBackend.MATH]):
+                expected = F.scaled_dot_product_attention(
+                    dequantize(query, q_descale.repeat_interleave(group_size, dim=1)),
+                    dequantize(key, k_descale).repeat_interleave(group_size, dim=1),
+                    dequantize(value, v_descale).repeat_interleave(group_size, dim=1),
+                )
+
+        self.assertEqual(actual.shape, torch.Size(shape))
+        self.assertEqual(actual.dtype, torch.bfloat16)  # FP8 inputs produce bfloat16
+        self.assertEqual(actual.float(), expected, atol=tol.atol, rtol=tol.rtol)
+
+    def test_fp8_attention_gqa_indivisible_heads(self, device):
+        query = self._fp8(SdpaShape(1, 3, 128, 64), device)
+        key = value = self._fp8(SdpaShape(1, 2, 128, 64), device)
+        one = self._descale(1, 2, device)
+
+        with self.assertRaisesRegex(RuntimeError, "must divide"):
             self._fp8_sdpa(query, key, value, one, one, one)
 
 
