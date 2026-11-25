@@ -318,6 +318,128 @@ class TestSDPAXpuOnly(NNTestCase):
         self.assertEqual(v_cow, v_copy)
         self.assertEqual(mask_cow, mask_copy)
 
+    @parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    @parametrize("is_causal", [False, True])
+    def test_onednn_attention_dropout_fwd_bwd_same_mask(
+        self, device, dtype, is_causal
+    ):
+        """Verify that OneDNN SDPA backward replays the same dropout mask as
+        forward using the saved philox seed/offset, without requiring
+        debug_softmax_mask.
+
+        With seq_len == head_dim == n, setting v = I gives out = dropout(P)
+        and grad_out = I gives grad_v = dropout(P)^T, so the nonzero positions
+        of both directly reflect the dropout mask applied in each pass.
+        """
+        batch, heads, n = 2, 4, 64
+        dropout_p = 0.5
+        torch.manual_seed(0)
+        q = torch.randn(batch, heads, n, n, device=device, dtype=dtype)
+        k = torch.randn(batch, heads, n, n, device=device, dtype=dtype)
+        eye = torch.eye(n, device=device, dtype=dtype).expand(batch, heads, n, n)
+        v = eye.clone().requires_grad_()
+
+        with sdpa_kernel(backends=[SDPBackend.OVERRIDEABLE]):
+            out = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=dropout_p, is_causal=is_causal
+            )
+        (grad_v,) = torch.autograd.grad(out, v, eye)
+
+        kept = out != 0
+        if is_causal:
+            tril_mask = torch.ones(n, n, device=device, dtype=torch.bool).tril()
+            kept_ratio = kept[:, :, tril_mask].float().mean().item()
+        else:
+            kept_ratio = kept.float().mean().item()
+        self.assertTrue(
+            0.4 < kept_ratio < 0.6,
+            f"Expected kept ratio near 0.5, got {kept_ratio}",
+        )
+        row_sum_mean = out.sum(dim=-1).float().mean().item()
+        self.assertTrue(
+            0.85 < row_sum_mean < 1.15,
+            f"Expected inverted dropout row sum mean near 1.0, got {row_sum_mean}",
+        )
+        self.assertEqual(kept, grad_v.transpose(-2, -1) != 0)
+
+    @parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    @parametrize("is_causal", [False, True])
+    @parametrize(
+        "shape",
+        [
+            # (batch, num_heads_q, num_heads_kv, seq_q, seq_kv, head_dim)
+            (2, 4, 4, 64, 128, 64),  # MHA, seq_q < seq_kv
+            (1, 8, 8, 128, 128, 32),  # MHA, square seq, small head_dim
+            (2, 8, 2, 128, 64, 128),  # GQA, seq_q > seq_kv, large head_dim
+            (2, 4, 4, 73, 97, 64),  # non-power-of-2 tail seq lengths
+        ],
+    )
+    def test_onednn_attention_dropout_determinism(
+        self, device, dtype, is_causal, shape
+    ):
+        """Verify that OneDNN SDPA with dropout produces deterministic forward
+        and backward results for the same seed, and different outputs for
+        different seeds.
+        """
+        batch, num_heads_q, num_heads_kv, seq_q, seq_kv, head_dim = shape
+        enable_gqa = num_heads_q != num_heads_kv
+        dropout_p = 0.3
+
+        torch.manual_seed(0)
+        q = torch.randn(
+            batch, num_heads_q, seq_q, head_dim, device=device, dtype=dtype
+        )
+        k = torch.randn(
+            batch, num_heads_kv, seq_kv, head_dim, device=device, dtype=dtype
+        )
+        v = torch.randn(
+            batch, num_heads_kv, seq_kv, head_dim, device=device, dtype=dtype
+        )
+        grad_out = torch.randn(
+            batch, num_heads_q, seq_q, head_dim, device=device, dtype=dtype
+        )
+
+        def run_fwd_bwd(seed):
+            q_ = q.clone().detach().requires_grad_(True)
+            k_ = k.clone().detach().requires_grad_(True)
+            v_ = v.clone().detach().requires_grad_(True)
+            torch.manual_seed(seed)
+            torch.xpu.manual_seed(seed)
+            with sdpa_kernel(backends=[SDPBackend.OVERRIDEABLE]):
+                out = F.scaled_dot_product_attention(
+                    q_,
+                    k_,
+                    v_,
+                    dropout_p=dropout_p,
+                    is_causal=is_causal,
+                    enable_gqa=enable_gqa,
+                )
+            out.backward(grad_out.clone())
+            return out.detach(), q_.grad.detach(), k_.grad.detach(), v_.grad.detach()
+
+        out1, gq1, gk1, gv1 = run_fwd_bwd(seed=42)
+        out2, gq2, gk2, gv2 = run_fwd_bwd(seed=42)
+
+        # Forward output must be bit-exact; backward allows small tolerance for atomic add
+        self.assertEqual(out1, out2, atol=0, rtol=0)
+        self.assertEqual(gq1, gq2, atol=1e-3, rtol=0)
+        self.assertEqual(gk1, gk2, atol=1e-3, rtol=0)
+        self.assertEqual(gv1, gv2, atol=1e-3, rtol=0)
+
+        # Different seed should produce a different output
+        torch.manual_seed(123)
+        torch.xpu.manual_seed(123)
+        with sdpa_kernel(backends=[SDPBackend.OVERRIDEABLE]):
+            out_diff = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+                enable_gqa=enable_gqa,
+            )
+        self.assertNotEqual(out1, out_diff)
+
 
 instantiate_device_type_tests(
     TestSDPAXpuOnly, globals(), only_for="xpu", allow_xpu=True
