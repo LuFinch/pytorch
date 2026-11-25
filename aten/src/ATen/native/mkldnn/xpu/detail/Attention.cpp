@@ -2,6 +2,7 @@
 #include <ATen/native/mkldnn/xpu/detail/Attr.h>
 #include <ATen/native/mkldnn/xpu/detail/Utils.h>
 #include <ATen/native/mkldnn/xpu/detail/oneDNN.h>
+#include <ATen/ops/full.h>
 #include <ATen/ops/ones.h>
 #include <ATen/ops/scalar_tensor.h>
 #include <ATen/ops/where.h>
@@ -188,10 +189,25 @@ struct SDPALogicalParams {
       LOGIC_TENSOR_DESC(logsumexp, sdpa_intermediate_dtype);
     }
     if (enable_dropout) {
-      LOGIC_SCALAR_TENSOR_DESC(
-          dropout_probability, logical_tensor::data_type::f32);
-      LOGIC_SCALAR_TENSOR_DESC(dropout_seed, logical_tensor::data_type::s64);
-      LOGIC_SCALAR_TENSOR_DESC(dropout_offset, logical_tensor::data_type::s64);
+      const dims scalar_shape = {1};
+      dropout_probability = {
+        static_cast<size_t>(TensorID::dropout_probability),
+        logical_tensor::data_type::f32,
+        scalar_shape,
+        logical_tensor::layout_type::strided,
+        logical_tensor::property_type::variable};
+      dropout_seed = {
+        static_cast<size_t>(TensorID::dropout_seed),
+        logical_tensor::data_type::s64,
+        scalar_shape,
+        logical_tensor::layout_type::strided,
+        logical_tensor::property_type::variable};
+      dropout_offset = {
+        static_cast<size_t>(TensorID::dropout_offset),
+        logical_tensor::data_type::s64,
+        scalar_shape,
+        logical_tensor::layout_type::strided,
+        logical_tensor::property_type::variable};
     }
 #undef LOGIC_TENSOR_DESC
 #undef LOGIC_SCALAR_TENSOR_DESC
@@ -626,10 +642,25 @@ struct SDPABackwardLogicalParams {
     LOGIC_TENSOR_DESC(grad_key, dtype);
     LOGIC_TENSOR_DESC(grad_value, dtype);
     if (enable_dropout) {
-      LOGIC_SCALAR_TENSOR_DESC(
-          dropout_probability, logical_tensor::data_type::f32);
-      LOGIC_SCALAR_TENSOR_DESC(dropout_seed, logical_tensor::data_type::s64);
-      LOGIC_SCALAR_TENSOR_DESC(dropout_offset, logical_tensor::data_type::s64);
+      const dims scalar_shape = {1};
+      dropout_probability = {
+        static_cast<size_t>(TensorID::dropout_probability),
+        logical_tensor::data_type::f32,
+        scalar_shape,
+        logical_tensor::layout_type::strided,
+        logical_tensor::property_type::variable};
+      dropout_seed = {
+        static_cast<size_t>(TensorID::dropout_seed),
+        logical_tensor::data_type::s64,
+        scalar_shape,
+        logical_tensor::layout_type::strided,
+        logical_tensor::property_type::variable};
+      dropout_offset = {
+        static_cast<size_t>(TensorID::dropout_offset),
+        logical_tensor::data_type::s64,
+        scalar_shape,
+        logical_tensor::layout_type::strided,
+        logical_tensor::property_type::variable};
     }
 #undef LOGIC_TENSOR_DESC
   }
@@ -1125,13 +1156,15 @@ void sdpa(
   if (attn_mask.has_value()) {
     ADD_INPUT((*attn_mask));
   }
+  Tensor dropout_tensor;
   if (enable_dropout) {
-    inputs.emplace_back(dnnl::graph::tensor::make_scalar_tensor(
-        l_inputs[i++], &dropout_probability));
-    inputs.emplace_back(dnnl::graph::tensor::make_scalar_tensor(
-        l_inputs[i++], static_cast<uint64_t*>(philox_seed.data_ptr())));
-    inputs.emplace_back(dnnl::graph::tensor::make_scalar_tensor(
-        l_inputs[i++], static_cast<uint64_t*>(philox_offset.data_ptr())));
+    dropout_tensor = at::full(
+        {},
+        dropout_probability,
+        query.options().dtype(at::kFloat));
+    ADD_INPUT(dropout_tensor);
+    ADD_INPUT(philox_seed);
+    ADD_INPUT(philox_offset);
   }
   ADD_INPUT(value_aligned);
 #undef ADD_INPUT
@@ -1267,13 +1300,15 @@ void sdpa_backward(
   if (attn_mask.has_value()) {
     ADD_INPUT((*attn_mask));
   }
+  Tensor dropout_tensor;
   if (enable_dropout) {
-    inputs.emplace_back(dnnl::graph::tensor::make_scalar_tensor(
-        l_inputs[i++], &dropout_probability));
-    inputs.emplace_back(dnnl::graph::tensor::make_scalar_tensor(
-        l_inputs[i++], static_cast<uint64_t*>(philox_seed.data_ptr())));
-    inputs.emplace_back(dnnl::graph::tensor::make_scalar_tensor(
-        l_inputs[i++], static_cast<uint64_t*>(philox_offset.data_ptr())));
+    dropout_tensor = at::full(
+        {},
+        dropout_probability,
+        query.options().dtype(at::kFloat));
+    ADD_INPUT(dropout_tensor);
+    ADD_INPUT(philox_seed);
+    ADD_INPUT(philox_offset);
   }
 #undef ADD_INPUT
 

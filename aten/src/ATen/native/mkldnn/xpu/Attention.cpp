@@ -106,7 +106,6 @@ bool can_use_overrideable_attention(sdp::sdp_params const& params, bool debug) {
       std::to_array<bool (*)(sdp::sdp_params const&, bool)>(
           {sdp::check_nested_tensor,
            sdp::check_tensor_shapes,
-           sdp::check_for_dropout,
            sdp::check_batch_size_and_num_heads_dense<
                true /*supports GQA*/,
                true /*requires_same_num_heads*/,
@@ -308,6 +307,11 @@ sdp::SDPBackend select_sdp_backend_xpu(sdp::sdp_params const& kernel_params) {
 } // namespace
 
 namespace at::native {
+
+namespace xpu::philox {
+  void unpack_onednn_wrapper(at::PhiloxXpuState arg, int64_t* seed_ptr, int64_t* offset_ptr);
+}
+
 // Referenced by native_functions.yaml and REGISTER_XPU_DISPATCH below.
 // NOLINTNEXTLINE(misc-use-internal-linkage)
 int64_t _fused_sdp_choice_xpu(
@@ -373,9 +377,6 @@ _scaled_dot_product_fused_attention_overrideable_xpu(
   TORCH_INTERNAL_ASSERT(
       query.size(1) % key.size(1) == 0,
       "scaled_dot_product_fused_attention_overrideable_xpu: number of heads in K/V must divide number of heads in Q");
-  TORCH_INTERNAL_ASSERT(
-      dropout_p == 0.0,
-      "scaled_dot_product_fused_attention_overrideable_xpu: Currently do not support dropout > 0");
   TORCH_CHECK(
       !(attn_bias.has_value() && is_causal),
       "scaled_dot_product_fused_attention_overrideable_xpu: attn_bias cannot present with is_causal");
@@ -401,7 +402,8 @@ _scaled_dot_product_fused_attention_overrideable_xpu(
   at::Tensor logsumexp =
       at::empty({batch_size, num_head_q, seq_len_q}, opts.dtype(at::kFloat));
 
-  at::Tensor philox_seed, philox_offset;
+  at::Tensor philox_seed = at::empty({}, at::dtype(at::kLong).device(at::kXPU));
+  at::Tensor philox_offset = at::empty({}, at::dtype(at::kLong).device(at::kXPU));
   if (dropout_p != 0.0) {
     auto gen = at::get_generator_or_default<at::XPUGeneratorImpl>(
         std::nullopt, at::xpu::detail::getDefaultXPUGenerator());
@@ -411,15 +413,8 @@ _scaled_dot_product_fused_attention_overrideable_xpu(
     // See Note [Acquire lock when using random generators]
     std::lock_guard<std::mutex> lock(gen->mutex_);
     at::PhiloxXpuState philox_state = gen->philox_xpu_state(counter_offset);
-    std::tuple<uint64_t, uint64_t> unpack_state =
-        xpu::philox::unpack(philox_state);
-    philox_seed = at::full(
-        {}, std::get<0>(unpack_state), at::dtype(at::kLong).device(at::kCPU));
-    philox_offset = at::full(
-        {}, std::get<1>(unpack_state), at::dtype(at::kLong).device(at::kCPU));
-  } else {
-    philox_seed = at::empty({}, at::dtype(at::kLong));
-    philox_offset = at::empty({}, at::dtype(at::kLong));
+    at::native::xpu::philox::unpack_onednn_wrapper(
+        philox_state, static_cast<int64_t*>(philox_seed.data_ptr()), static_cast<int64_t*>(philox_offset.data_ptr()));
   }
 
   at::native::onednn::sdpa(
